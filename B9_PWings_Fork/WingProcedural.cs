@@ -877,6 +877,10 @@ namespace WingProcedural
             p.transform.position = pos;
             p.transform.rotation = rot;
             p.transform.SetParent(parentWing.transform, true);
+            // The gizmos treat these as the part's home (reset snaps to them) and they
+            // persist in the craft; attachPart sets them from the local pose.
+            p.attPos0 = p.transform.localPosition;
+            p.attRotation0 = p.transform.localRotation;
 
             // Link the tree exactly once. Calling both setParent AND addChild adds the
             // child to parent.children twice -> the part appears twice in the vessel
@@ -905,6 +909,8 @@ namespace WingProcedural
                     cs.isAttached = true;
                     WingProcedural pw = FirstOfTypeOrDefault<WingProcedural>(parentWing.Modules);
                     cs.isMirrored = pw != null && pw.isMirrored;
+                    cs.mirrorKnown = true;
+                    cs.isMirroredPrev = cs.isMirrored;
                     configure(cs);
                 }
 
@@ -999,36 +1005,16 @@ namespace WingProcedural
 
         // Link parts as a mirror-symmetry group so the editor moves/deletes them together
         // instead of duplicating on edit.
-        private static void LinkMirrorSymmetry(List<Part> parts)
+        private static void LinkSymmetry(List<Part> parts, SymmetryMethod method)
         {
             if (parts == null || parts.Count < 2) return;
             foreach (Part a in parts)
             {
-                a.symMethod = SymmetryMethod.Mirror;
+                a.symMethod = method;
                 a.symmetryCounterparts.Clear();
                 foreach (Part b in parts)
                     if (b != a) a.symmetryCounterparts.Add(b);
             }
-        }
-
-        // Reflect a world pose across the vessel's mirror-symmetry plane (through the root
-        // part, normal = root's right axis). A control-surface counterpart must be a true
-        // reflection of the primary, not the same relative pose (verified against a
-        // hand-placed reference craft: counterpart rot = reflected primary rot).
-        private static void ReflectAcrossSymmetryPlane(Vector3 pos, Quaternion rot, out Vector3 rPos, out Quaternion rRot)
-        {
-            Vector3 n = Vector3.right;
-            Vector3 p0 = Vector3.zero;
-            if (EditorLogic.SortedShipList != null && EditorLogic.SortedShipList.Count > 0)
-            {
-                Part root = EditorLogic.SortedShipList[0];
-                n = root.transform.right.normalized;
-                p0 = root.transform.position;
-            }
-            rPos = pos - 2f * Vector3.Dot(pos - p0, n) * n;
-            Vector3 v = new Vector3(rot.x, rot.y, rot.z);
-            Vector3 vr = -v + 2f * Vector3.Dot(v, n) * n;
-            rRot = new Quaternion(vr.x, vr.y, vr.z, rot.w);
         }
 
         // World position where a full-span split control surface's origin should sit.
@@ -1037,25 +1023,39 @@ namespace WingProcedural
         // the trailing edge, Z = 0 (thickness, flush).
         private Vector3 TrailingEdgeMidspanWorld()
         {
-            float rootTZ = sharedBaseWidthRoot * 0.5f - sharedBaseOffsetRoot;
-            float tipTZ = sharedBaseWidthTip * 0.5f + sharedBaseOffsetTip;
+            return TrailingEdgeMidspanWorld(this, part.transform);
+        }
+
+        // Geometry and pose taken separately, so a symmetry counterpart can place itself
+        // on its own wing using the fields of the wing the follow reads from.
+        private static Vector3 TrailingEdgeMidspanWorld(WingProcedural geo, Transform t)
+        {
+            float rootTZ = geo.sharedBaseWidthRoot * 0.5f - geo.sharedBaseOffsetRoot;
+            float tipTZ = geo.sharedBaseWidthTip * 0.5f + geo.sharedBaseOffsetTip;
             float midTZ = (rootTZ + tipTZ) * 0.5f;
-            Vector3 local = new Vector3(sharedBaseLength * 0.5f, -midTZ, 0f);
-            return part.transform.position + part.transform.rotation * local;
+            Vector3 local = new Vector3(geo.sharedBaseLength * 0.5f, -midTZ, 0f);
+            return t.position + t.rotation * local;
         }
 
         // Rotation for a control surface attached to a wing's trailing edge: the wing's
-        // rotation turned 180 deg about its local up axis, plus a small tilt about the
-        // chord axis so the surface's span follows the wing's (swept) trailing edge.
-        // Both terms were verified against a hand-placed reference craft.
+        // rotation, a small tilt about the thickness axis so the surface's span follows
+        // the wing's (swept) trailing edge, and on the isMirrored side a half turn about
+        // the chord axis. That half turn is KSP's own convention: mirroring a part adds
+        // 180 deg about its up axis only when its surface-attach node lies along X, which
+        // is true of a wing (node -1,0,0) and false of a control surface (node 0,1,0), so
+        // the two sides of the symmetry plane hold a control the opposite way round
+        // relative to the wing. The control mesh's isMirrored root/tip swap is built for
+        // that. The mirrored form was verified against a hand-placed reference craft, the
+        // other by checking that KSP's own mirror of it comes out identical.
         private static Quaternion CtrlSrfRotationForWing(WingProcedural wing)
         {
             float rootTZ = wing.sharedBaseWidthRoot * 0.5f - wing.sharedBaseOffsetRoot;
             float tipTZ = wing.sharedBaseWidthTip * 0.5f + wing.sharedBaseOffsetTip;
             float tilt = Mathf.Atan2(rootTZ - tipTZ, wing.sharedBaseLength) * Mathf.Rad2Deg;
-            return wing.part.transform.rotation
-                 * Quaternion.AngleAxis(tilt, Vector3.forward)
-                 * Quaternion.AngleAxis(180f, Vector3.up);
+            Quaternion rot = wing.part.transform.rotation * Quaternion.AngleAxis(tilt, Vector3.forward);
+            if (wing.isMirrored)
+                rot *= Quaternion.AngleAxis(180f, Vector3.up);
+            return rot;
         }
 
         /// <summary>
@@ -1069,14 +1069,18 @@ namespace WingProcedural
         /// </summary>
         private void SplitTrailingEdgeIntoControlSurface()
         {
-            if (isCtrlSrf || !isAttached)
+            // Not on an all-moving wing: its cfg forbids surface children, and in flight
+            // the whole part rotates through anything hinged to it.
+            if (isCtrlSrf || isWingAsCtrlSrf || !isAttached)
                 return;
 
-            // Capture the trailing-edge shape being moved out onto the surface.
+            // Capture the trailing-edge shape being moved out onto the surface. Type 1 is
+            // "No edge": a flat cap with no extent, whatever width value is still stored,
+            // so there is nothing to split off.
             float teType = sharedEdgeTypeTrailing;
             float teRoot = sharedEdgeWidthTrailingRoot;
             float teTip = sharedEdgeWidthTrailingTip;
-            if (teRoot <= 0f && teTip <= 0f)
+            if (Mathf.RoundToInt(teType) <= 1 || (teRoot <= 0f && teTip <= 0f))
                 return;
 
             if (EditorLogic.fetch == null)
@@ -1111,7 +1115,7 @@ namespace WingProcedural
             // spawn a broken control. Fall back to neutral values (no rake offset, no te scale).
             bool splitDegenerate = sharedBaseLength < 1e-4f || splitTELength < 1e-4f;
             float splitTanSweep = splitDegenerate ? 0f : splitDeltaTZ / sharedBaseLength;   // = tan(TE sweep)
-            float splitCtrlOffset = -splitTanSweep;
+            float splitCtrlOffset = ClampCtrlSrfOffset(-splitTanSweep);   // held at the mesh's limit past ~56 deg
             // The raked control measures te-width perpendicular to the TE-aligned span,
             // while the wing measures it perpendicular to the wing span; the two differ by
             // the sweep angle, so controlTe = wingTe * cos(sweep) = wingTe * length/TElength.
@@ -1154,23 +1158,23 @@ namespace WingProcedural
             else
             {
                 attached.Add(primary);
-                // Place each counterpart as a true reflection of the primary's pose so it
-                // mirrors correctly (same relative pose gave a rotated, un-mirrored copy).
-                Vector3 primaryPos = TrailingEdgeMidspanWorld();
-                Quaternion primaryRot = CtrlSrfRotationForWing(this);
+                // Pose each counterpart from its own wing, the same way as the primary.
+                // CtrlSrfRotationForWing already knows which way round a control sits on
+                // each side of the symmetry plane, and a radial counterpart is just
+                // another wing; reflecting the primary's pose instead was only right for
+                // a 2x mirror pair with the root's right axis on world X.
                 foreach (Part p in part.symmetryCounterparts)
                 {
                     WingProcedural w = FirstOfTypeOrDefault<WingProcedural>(p.Modules);
                     if (w == null) continue;
-                    ReflectAcrossSymmetryPlane(primaryPos, primaryRot, out Vector3 cPos, out Quaternion cRot);
                     try
                     {
-                        Part cp = AttachCtrlSrfTo(ap, p, cPos, cRot, cfg);
+                        Part cp = AttachCtrlSrfTo(ap, p, TrailingEdgeMidspanWorld(w, p.transform), CtrlSrfRotationForWing(w), cfg);
                         if (cp != null) attached.Add(cp);
                     }
                     catch (Exception e) { Debug.LogError("[B9PW] Split counterpart auto-attach failed: " + e); }
                 }
-                LinkMirrorSymmetry(attached);
+                LinkSymmetry(attached, part.symMethod);
             }
 
             // Square off this wing and its counterparts: zero the trailing edge so the
@@ -1183,8 +1187,10 @@ namespace WingProcedural
                     ZeroTrailingEdge(sym);
             }
 
+            // Push an undo step, as the editor does after its own attach; this also fires
+            // onEditorShipModified. Firing the event alone left the split off the undo stack.
             if (EditorLogic.fetch != null)
-                GameEvents.onEditorShipModified.Fire(EditorLogic.fetch.ship);
+                EditorLogic.fetch.SetBackup();
         }
 
         private static void ZeroTrailingEdge(WingProcedural wing)
@@ -1196,16 +1202,91 @@ namespace WingProcedural
 
         #endregion Split trailing edge into control surface
 
+        #region Mirror side
+
+        // Side of the symmetry plane this control was last built for. UpdateOnEditorAttach
+        // recomputes isMirrored whenever the part is attached - including as a child of a
+        // wing the user carried across the plane or turned vertical - and the control
+        // mesh then swaps root and tip while the transform stays put, so the control looks
+        // turned end for end. The two sides' conventions differ by exactly a half turn
+        // about the chord axis (see CtrlSrfRotationForWing); applying it restores what
+        // the user saw. Unknown until the part has been attached or loaded attached, so a
+        // fresh part from the list is left alone; a copy inherits a side from its
+        // original (see OnWasCopied).
+        private bool mirrorKnown = false;
+        private bool isMirroredPrev = false;
+
+        // A copy's pose is derived from the original's, so the side it is built for
+        // follows from the original's: a mirror-symmetry clone is the mirror image and
+        // so built for the OPPOSITE side; a radial clone or an Alt+click copy is a
+        // rotation or a straight copy and keeps the original's. Its own attach then
+        // compares that with where it landed. Called on the original, before the copy's
+        // OnCopy and OnStart. An original that has never been attached has no known
+        // side, and neither then does its copy.
+        public override void OnWasCopied(PartModule copyPartModule, bool asSymCounterpart)
+        {
+            base.OnWasCopied(copyPartModule, asSymCounterpart);
+            if (!(copyPartModule is WingProcedural copy) || !isCtrlSrf || isWingAsCtrlSrf || !mirrorKnown)
+                return;
+            bool mirrored = asSymCounterpart
+                && EditorLogic.fetch != null && EditorLogic.fetch.symmetryMethod == SymmetryMethod.Mirror;
+            copy.mirrorKnown = true;
+            copy.isMirroredPrev = mirrored ? !isMirroredPrev : isMirroredPrev;
+            // Build the copy for that side straight away, so the ghost being dragged
+            // looks right; its attach recomputes the flag from where it lands anyway.
+            copy.isMirrored = copy.isMirroredPrev;
+        }
+
+        // A copy sits wherever it sits; nothing about the original's edge station applies.
+        public override void OnCopy(PartModule fromModule)
+        {
+            base.OnCopy(fromModule);
+            fpInit = false;
+            fpApplied = false;
+        }
+
+        private void CompensateMirrorSideChange()
+        {
+            if (!isCtrlSrf || isWingAsCtrlSrf)
+                return;
+            bool changed = mirrorKnown && isMirrored != isMirroredPrev;
+            mirrorKnown = true;
+            isMirroredPrev = isMirrored;
+            if (!changed)
+                return;
+
+            HalfTurnAboutChord(part);
+        }
+
+        private static void HalfTurnAboutChord(Part p)
+        {
+            p.transform.rotation *= Quaternion.AngleAxis(180f, Vector3.up);
+            p.attPos0 = p.transform.localPosition;
+            p.attRotation0 = p.transform.localRotation;
+        }
+
+        #endregion Mirror side
+
         #region Follow parent wing
 
         // Keeps an attached control surface tracking its parent wing's span/sweep/position
-        // (editor only) while keeping its own shape (trailing-edge width + edge type). The
+        // and thickness (editor only) while keeping its own shape (trailing-edge width +
+        // edge type). The
         // wing->control mapping is the same one the split derives: length = swept-TE length,
         // offset = -tan(sweep), pose = trailing-edge midspan + sweep tilt. te-width is NOT
         // re-derived - the split zeroed the wing's te, so the wing no longer carries it, and
         // keeping the control's te is the "keep shape" behaviour.
         private bool fpInit = false;
-        private float fpLen, fpWR, fpWT, fpOR, fpOT;
+        private float fpLen, fpWR, fpWT, fpOR, fpOT, fpTR, fpTT;
+        // Each end's thickness as a FRACTION of the wing's thickness at that span station
+        // (root end nearer the wing root). A freshly split control has 1 at both ends and
+        // simply tracks the wing; one the user thinned keeps its ratio.
+        private float fpThickRootFrac = 1f, fpThickTipFrac = 1f;
+        // Whether this control sits on the wing's trailing edge at all. A slat, spoiler
+        // or wingtip control is attached to the same wing but has no business being
+        // dragged onto the trailing edge, so those are left alone. Decided at capture,
+        // i.e. re-decided whenever the user moves the control or re-attaches it.
+        private bool fpOnEdge = false;
         // The control's span as FRACTIONS of the wing's trailing edge: how long it is
         // (lengthFrac) and where its centre sits relative to TE midspan (centreFrac, in
         // -0.5..+0.5 along the TE). Preserving these is what keeps a flaps/aileron setup
@@ -1215,6 +1296,25 @@ namespace WingProcedural
         // this to the rebuilt frame tracks sweep without ever re-orienting the control
         // itself - so a control keeps whichever way round it already sits.
         private Quaternion fpRelRot = Quaternion.identity;
+        // What follow last wrote to this control (fields + local pose). A wing-idle frame
+        // re-captures the fractions only when the control has moved off this - i.e. the
+        // user edited it - never from follow's own output. So a wing dragged past the
+        // shear limit and back restores exactly: nothing built while out of range can
+        // become the new definition of where the control belongs.
+        private bool fpApplied = false;
+        private float fpAppliedLen, fpAppliedOffR, fpAppliedOffT, fpAppliedThkR, fpAppliedThkT;
+        private Vector3 fpAppliedLocalPos;
+        private Quaternion fpAppliedLocalRot;
+
+        // Shear the control-surface mesh will actually build. UpdateGeometry clamps the
+        // offset to this range - and clamps root and tip slightly differently - so a value
+        // written inside it keeps both ends identical and the built shape equal to the
+        // requested one. Past it (|tan sweep| > 1.5, ~56 deg) the control's end edges can
+        // no longer be parallel to the wing's chord; they stay at the limit instead.
+        private static float ClampCtrlSrfOffset(float offset)
+        {
+            return Mathf.Clamp(offset, sharedBaseOffsetLimits.z, sharedBaseOffsetLimits.w);
+        }
 
         private void FollowParentWing()
         {
@@ -1225,27 +1325,90 @@ namespace WingProcedural
             WingProcedural wing = FirstOfTypeOrDefault<WingProcedural>(part.parent.Modules);
             if (wing == null || wing.isCtrlSrf)
                 return;
+            WingProcedural geo = FollowGeometrySource(wing);
 
             bool changed =
-                wing.sharedBaseLength != fpLen
-                || wing.sharedBaseWidthRoot != fpWR || wing.sharedBaseWidthTip != fpWT
-                || wing.sharedBaseOffsetRoot != fpOR || wing.sharedBaseOffsetTip != fpOT;
+                geo.sharedBaseLength != fpLen
+                || geo.sharedBaseWidthRoot != fpWR || geo.sharedBaseWidthTip != fpWT
+                || geo.sharedBaseOffsetRoot != fpOR || geo.sharedBaseOffsetTip != fpOT
+                || geo.sharedBaseThicknessRoot != fpTR || geo.sharedBaseThicknessTip != fpTT;
 
-            fpLen = wing.sharedBaseLength;
-            fpWR = wing.sharedBaseWidthRoot; fpWT = wing.sharedBaseWidthTip;
-            fpOR = wing.sharedBaseOffsetRoot; fpOT = wing.sharedBaseOffsetTip;
+            fpLen = geo.sharedBaseLength;
+            fpWR = geo.sharedBaseWidthRoot; fpWT = geo.sharedBaseWidthTip;
+            fpOR = geo.sharedBaseOffsetRoot; fpOT = geo.sharedBaseOffsetTip;
+            fpTR = geo.sharedBaseThicknessRoot; fpTT = geo.sharedBaseThicknessTip;
 
-            // While the wing is untouched, keep re-reading where this control sits on the
-            // edge, so moving/resizing it by hand redefines what gets preserved. The first
-            // pass lands here too, so loading a craft never reshapes anything.
+            // While the wing is untouched, re-read where this control sits on the edge if
+            // the user has moved or resized it by hand, so that redefines what gets
+            // preserved. The first pass lands here too, so loading a craft never reshapes
+            // anything. Frames where nothing about the control changed keep the last
+            // capture - see fpApplied.
             if (!fpInit || !changed)
             {
                 fpInit = true;
-                CaptureSpanFractions(wing);
+                if (!fpApplied || ControlEditedSinceApplied())
+                {
+                    if (CaptureSpanFractions(wing, geo))
+                        RecordApplied();
+                }
                 return;
             }
 
-            ApplyFollow(wing);
+            if (fpOnEdge)
+                ApplyFollow(wing, geo);
+        }
+
+        // The wing module whose fields the follow reads: the lowest instance ID across the
+        // wing and its symmetry counterparts. Mirrored wings sync their fields through
+        // UpdateCounterparts a frame apart, so two mirrored controls each reading their
+        // own wing computed slightly different lengths mid-drag; the controls then synced
+        // THOSE through their own UpdateCounterparts, each side took the other's value as
+        // a hand edit and re-captured its fraction against its own edge length, and the
+        // fraction ratcheted down a little per drag step. Reading one wing makes both
+        // sides' fields bit-identical, so the sync is a no-op. Pose still comes from each
+        // control's own wing transform.
+        private WingProcedural FollowGeometrySource(WingProcedural wing)
+        {
+            WingProcedural geo = wing;
+            foreach (Part p in wing.part.symmetryCounterparts)
+            {
+                WingProcedural c = FirstOfTypeOrDefault<WingProcedural>(p.Modules);
+                if (c != null && c.GetInstanceID() < geo.GetInstanceID())
+                    geo = c;
+            }
+            return geo;
+        }
+
+        private bool ControlEditedSinceApplied()
+        {
+            return sharedBaseLength != fpAppliedLen
+                || sharedBaseOffsetRoot != fpAppliedOffR || sharedBaseOffsetTip != fpAppliedOffT
+                || sharedBaseThicknessRoot != fpAppliedThkR || sharedBaseThicknessTip != fpAppliedThkT
+                || part.transform.localPosition != fpAppliedLocalPos
+                || part.transform.localRotation != fpAppliedLocalRot;
+        }
+
+        private void RecordApplied()
+        {
+            fpApplied = true;
+            fpAppliedLen = sharedBaseLength;
+            fpAppliedOffR = sharedBaseOffsetRoot; fpAppliedOffT = sharedBaseOffsetTip;
+            fpAppliedThkR = sharedBaseThicknessRoot; fpAppliedThkT = sharedBaseThicknessTip;
+            fpAppliedLocalPos = part.transform.localPosition;
+            fpAppliedLocalRot = part.transform.localRotation;
+        }
+
+        // Wing thickness at the span stations of this control's two ends. Stations run
+        // 0 (wing root) to 1 (tip); the control's centre sits at 0.5 + centreFrac and its
+        // ends lengthFrac/2 either side. Its root field maps to the end nearer the wing
+        // root on both sides of the symmetry plane (the mesh's isMirrored swap and the
+        // pose convention cancel), which is also how the split assigns them.
+        private void WingThicknessAtEnds(WingProcedural geo, out float atRoot, out float atTip)
+        {
+            float sRoot = Mathf.Clamp01(0.5f + fpCentreFrac - fpLengthFrac * 0.5f);
+            float sTip = Mathf.Clamp01(0.5f + fpCentreFrac + fpLengthFrac * 0.5f);
+            atRoot = Mathf.Lerp(geo.sharedBaseThicknessRoot, geo.sharedBaseThicknessTip, sRoot);
+            atTip = Mathf.Lerp(geo.sharedBaseThicknessRoot, geo.sharedBaseThicknessTip, sTip);
         }
 
         // Trailing-edge frame of the wing, in the wing's PART transform space:
@@ -1253,25 +1416,44 @@ namespace WingProcedural
         // Z = thickness. That's the convention the gizmo drag code and
         // TrailingEdgeMidspanWorld use - NOT the mesh builder's frame (which is
         // X=thickness, Y=chord, Z=span; the mesh child is rotated relative to the part).
-        private void TrailingEdgeFrame(WingProcedural wing, out Vector3 teMid, out Vector3 teDirLocal, out float teLen, out float dTZ)
+        private void TrailingEdgeFrame(WingProcedural wing, WingProcedural geo, out Vector3 teMid, out Vector3 teDirLocal, out float teLen, out float dTZ)
         {
-            float rootTZ = wing.sharedBaseWidthRoot * 0.5f - wing.sharedBaseOffsetRoot;
-            float tipTZ = wing.sharedBaseWidthTip * 0.5f + wing.sharedBaseOffsetTip;
+            float rootTZ = geo.sharedBaseWidthRoot * 0.5f - geo.sharedBaseOffsetRoot;
+            float tipTZ = geo.sharedBaseWidthTip * 0.5f + geo.sharedBaseOffsetTip;
             dTZ = rootTZ - tipTZ;
-            teDirLocal = new Vector3(wing.sharedBaseLength, dTZ, 0f).normalized;
-            teMid = wing.TrailingEdgeMidspanWorld();
-            teLen = Mathf.Sqrt(wing.sharedBaseLength * wing.sharedBaseLength + dTZ * dTZ);
+            teDirLocal = new Vector3(geo.sharedBaseLength, dTZ, 0f).normalized;
+            teMid = TrailingEdgeMidspanWorld(geo, wing.part.transform);
+            teLen = Mathf.Sqrt(geo.sharedBaseLength * geo.sharedBaseLength + dTZ * dTZ);
         }
 
-        private void CaptureSpanFractions(WingProcedural wing)
+        // False when the wing has no span: its "trailing edge" is then just the chordwise
+        // stub between root and tip offsets, and fractions taken against that are
+        // meaningless. The caller keeps the previous capture and tries again later.
+        private bool CaptureSpanFractions(WingProcedural wing, WingProcedural geo)
         {
-            TrailingEdgeFrame(wing, out Vector3 teMid, out Vector3 teDirLocal, out float teLen, out float _);
-            if (teLen < 1e-4f)
-                return;
+            TrailingEdgeFrame(wing, geo, out Vector3 teMid, out Vector3 teDirLocal, out float teLen, out float _);
+            if (geo.sharedBaseLength < 1e-4f || teLen < 1e-4f)
+                return false;
             Vector3 teDir = wing.part.transform.TransformDirection(teDirLocal);
             fpLengthFrac = sharedBaseLength / teLen;
-            fpCentreFrac = Vector3.Dot(part.transform.position - teMid, teDir) / teLen;
+            Vector3 fromMid = part.transform.position - teMid;
+            float along = Vector3.Dot(fromMid, teDir);
+            fpCentreFrac = along / teLen;
             fpRelRot = Quaternion.Inverse(TrailingEdgeFrameWorld(wing, teDirLocal)) * part.transform.rotation;
+
+            // On the edge: hinge close to the trailing-edge line (a spoiler is half a
+            // chord forward, a slat a whole one), roughly parallel to it, and within it.
+            float offLine = (fromMid - teDir * along).magnitude;
+            float meanChord = 0.5f * (geo.sharedBaseWidthRoot + geo.sharedBaseWidthTip);
+            float alignment = Mathf.Abs(Vector3.Dot(part.transform.right, teDir));
+            fpOnEdge = offLine <= 0.1f * meanChord + 0.05f
+                    && alignment >= 0.7f
+                    && Mathf.Abs(fpCentreFrac) <= 0.6f;
+
+            WingThicknessAtEnds(geo, out float wtRoot, out float wtTip);
+            fpThickRootFrac = wtRoot > 1e-4f ? sharedBaseThicknessRoot / wtRoot : 1f;
+            fpThickTipFrac = wtTip > 1e-4f ? sharedBaseThicknessTip / wtTip : 1f;
+            return true;
         }
 
         // Orthonormal frame sitting on the wing's trailing edge: forward = along the edge,
@@ -1282,10 +1464,10 @@ namespace WingProcedural
             return wing.part.transform.rotation * Quaternion.LookRotation(teDirLocal, Vector3.forward);
         }
 
-        private void ApplyFollow(WingProcedural wing)
+        private void ApplyFollow(WingProcedural wing, WingProcedural geo)
         {
-            TrailingEdgeFrame(wing, out Vector3 teMid, out Vector3 teDirLocal, out float teLen, out float dTZ);
-            if (wing.sharedBaseLength < 1e-4f || teLen < 1e-4f)
+            TrailingEdgeFrame(wing, geo, out Vector3 teMid, out Vector3 teDirLocal, out float teLen, out float dTZ);
+            if (geo.sharedBaseLength < 1e-4f || teLen < 1e-4f)
                 return;
             Vector3 teDir = wing.part.transform.TransformDirection(teDirLocal);
 
@@ -1298,11 +1480,25 @@ namespace WingProcedural
             part.transform.rotation = TrailingEdgeFrameWorld(wing, teDirLocal) * fpRelRot;
 
             // Keep this control's slice of the edge: same fraction of the length, same
-            // station along it. Thickness / te-width are its own shape - left alone.
+            // station along it. te-width is its own shape - left alone.
             part.transform.position = teMid + teDir * (fpCentreFrac * teLen);
             sharedBaseLength = fpLengthFrac * teLen;
-            sharedBaseOffsetRoot = -dTZ / wing.sharedBaseLength;
+            // Shear = -tan(TE sweep), held at the mesh's limit beyond it. The target is
+            // recomputed from the wing every pass, so nothing is lost while it's pinned.
+            sharedBaseOffsetRoot = ClampCtrlSrfOffset(-dTZ / geo.sharedBaseLength);
             sharedBaseOffsetTip = sharedBaseOffsetRoot;
+            // Thickness scales with the wing's at each end.
+            WingThicknessAtEnds(geo, out float wtRoot, out float wtTip);
+            sharedBaseThicknessRoot = fpThickRootFrac * wtRoot;
+            sharedBaseThicknessTip = fpThickTipFrac * wtTip;
+
+            // The editor's gizmos treat attPos0/attRotation0 as the part's home (reset
+            // snaps back to them), and attachPart sets them from the local pose. Keep
+            // them current, or a reset returns the control to wherever the split left it.
+            part.attPos0 = part.transform.localPosition;
+            part.attRotation0 = part.transform.localRotation;
+
+            RecordApplied();
 
             // Field changes are picked up by CheckAllFieldValues later this frame, which
             // fires UpdateGeometry; no explicit call needed here.
@@ -1390,8 +1586,9 @@ namespace WingProcedural
             ShowCrossSection(station, cutNormal, cam.transform.position);
 
             // Commit on a full left-click (release), so the same event doesn't also
-            // place the part SpawnPart puts on the cursor.
-            if (Input.GetMouseButtonUp(0))
+            // place the part SpawnPart puts on the cursor. A click on the mod's own window
+            // (e.g. the cancel toggle) is for the window - raw Input sees it regardless.
+            if (Input.GetMouseButtonUp(0) && !(uiWindowActive && UIUtility.uiRectWindowEditor.Contains(UIUtility.GetMousePos())))
             {
                 Debug.Log("[B9PW] Bisect at f=" + f.ToString("F3"));
                 BisectAt(f);
@@ -1435,24 +1632,19 @@ namespace WingProcedural
         }
 
         // World-space span endpoints of this control surface (root = inboard end,
-        // nearer the parent wing). Derived from the ctrl-frame mesh bounds so we don't
-        // depend on the local axis convention.
+        // nearer the parent wing). The origin sits at the hinge's mid-span and the
+        // hinge runs along part-local X, so the ends are half a length either way.
+        // (Reading them off the mesh bounds' longest axis instead picked the chord on
+        // a deep rudder, and bisect then cut, placed and re-anchored chordwise.)
         private bool SpanEndpoints(out Vector3 root, out Vector3 tip)
         {
             root = Vector3.zero; tip = Vector3.zero;
-            MeshFilter mf = meshFilterCtrlFrame;
-            if (mf == null || mf.sharedMesh == null)
+            if (sharedBaseLength < 1e-4f)
                 return false;
 
-            Bounds b = mf.sharedMesh.bounds;
-            Vector3 ext = b.extents;
-            Vector3 axis; float halfLen;
-            if (ext.x >= ext.y && ext.x >= ext.z) { axis = Vector3.right; halfLen = ext.x; }
-            else if (ext.y >= ext.z) { axis = Vector3.up; halfLen = ext.y; }
-            else { axis = Vector3.forward; halfLen = ext.z; }
-
-            Vector3 e0 = mf.transform.TransformPoint(b.center + axis * halfLen);
-            Vector3 e1 = mf.transform.TransformPoint(b.center - axis * halfLen);
+            Vector3 half = part.transform.right * (sharedBaseLength * 0.5f);
+            Vector3 e0 = part.transform.position + half;
+            Vector3 e1 = part.transform.position - half;
             if (part.parent != null)
             {
                 // Root is the end at the parent wing's ROOT, i.e. span-position ~0 (the wing
@@ -1502,8 +1694,10 @@ namespace WingProcedural
             float tipEdge = sharedEdgeWidthTrailingTip;
             float teType = sharedEdgeTypeTrailing;
 
-            // Outboard [f,1] piece geometry.
-            Action<WingProcedural> cfg = cs =>
+            // Outboard [f,1] piece geometry. Built per source control: a symmetry
+            // counterpart's piece is posed from that counterpart, so it must carry that
+            // counterpart's side and colours, not this control's.
+            Func<WingProcedural, Action<WingProcedural>> cfgFor = src => cs =>
             {
                 cs.sharedBaseLength = (1f - f) * L;
                 cs.sharedBaseWidthRoot = cutWidth;
@@ -1515,7 +1709,12 @@ namespace WingProcedural
                 cs.sharedEdgeTypeTrailing = teType;
                 cs.sharedEdgeWidthTrailingRoot = cutEdge;
                 cs.sharedEdgeWidthTrailingTip = tipEdge;
-                CopyColoursBySection(part, cs.part);
+                // Posed from the source control, so it must be built for that control's
+                // side - which can differ from the wing's for a rudder on a centreline fin.
+                cs.isMirrored = src.isMirrored;
+                cs.mirrorKnown = true;
+                cs.isMirroredPrev = src.isMirrored;
+                CopyColoursBySection(src.part, cs.part);
             };
 
             // Both halves must stay the same part as the surface being bisected.
@@ -1540,7 +1739,7 @@ namespace WingProcedural
                 // by ~half the chord and caused the outboard gap). Origin is at the span
                 // centre; the outboard [f,1] centre is f/2*L toward the tip.
                 Vector3 obc = part.transform.position + (tip - root).normalized * (f * 0.5f * sharedBaseLength);
-                try { primary = AttachCtrlSrfTo(ap, part.parent, obc, part.transform.rotation, cfg); }
+                try { primary = AttachCtrlSrfTo(ap, part.parent, obc, part.transform.rotation, cfgFor(this)); }
                 catch (Exception e) { Debug.LogError("[B9PW] Bisect auto-attach EXC -> one-click: " + e); }
             }
             else
@@ -1550,7 +1749,7 @@ namespace WingProcedural
 
             if (primary == null)
             {
-                SpawnOnCursor(ap, cfg);
+                SpawnOnCursor(ap, cfgFor(this));
             }
             else
             {
@@ -1563,13 +1762,13 @@ namespace WingProcedural
                         Vector3 obc2 = sc.part.transform.position + (t2 - r2).normalized * (f * 0.5f * sc.sharedBaseLength);
                         try
                         {
-                            Part cp = AttachCtrlSrfTo(ap, p.parent, obc2, p.transform.rotation, cfg);
+                            Part cp = AttachCtrlSrfTo(ap, p.parent, obc2, p.transform.rotation, cfgFor(sc));
                             if (cp != null) attached.Add(cp);
                         }
                         catch (Exception e) { Debug.LogError("[B9PW] Bisect counterpart auto-attach failed: " + e); }
                     }
                 }
-                LinkMirrorSymmetry(attached);
+                LinkSymmetry(attached, part.symMethod);
             }
 
             // Crop this part (and its symmetry counterparts) to the inboard [0,f] half.
@@ -1584,7 +1783,7 @@ namespace WingProcedural
             }
 
             if (EditorLogic.fetch != null)
-                GameEvents.onEditorShipModified.Fire(EditorLogic.fetch.ship);
+                EditorLogic.fetch.SetBackup();
         }
 
         private static void CropInboard(WingProcedural cs, float f, float L, float cutWidth, float cutTipOffset, float cutThk, float cutEdge)
@@ -1605,6 +1804,7 @@ namespace WingProcedural
 
             if (haveRoot && cs.SpanEndpoints(out Vector3 rootAfter, out Vector3 tipAfter))
                 cs.part.transform.position += rootBefore - rootAfter;
+                cs.part.attPos0 = cs.part.transform.localPosition;
         }
 
         // Chosen so the outline reads as a bold line without hiding the profile. World
@@ -3133,6 +3333,15 @@ namespace WingProcedural
             Setup();
             part.OnEditorAttach += new Callback(UpdateOnEditorAttach);
             part.OnEditorDetach += new Callback(UpdateOnEditorDetach);
+            // Loaded in place: whatever side it's on, it was saved built for it. A part
+            // spawned for placement has no parent yet; a copy already has its side from
+            // OnWasCopied (its children have parents, so the parent test alone would
+            // wrongly stamp them with the original's side).
+            if (part.parent != null && !part.isClone)
+            {
+                mirrorKnown = true;
+                isMirroredPrev = isMirrored;
+            }
 
             if (!UIUtility.uiStyleConfigured)
             {
@@ -3183,6 +3392,11 @@ namespace WingProcedural
             GameEvents.onGameSceneLoadRequested.Remove(OnSceneSwitch);
             GameEvents.onEditorPartEvent.Remove(OnEditorPartEvent);
             GameEvents.onVesselWasModified.Remove(OnVesselModifiedForSweep);
+            // Undo, New/Load or deleting the part can destroy this instance with the
+            // bisect pick/place lock still held (or the post-commit countdown armed), and
+            // nothing else ever releases it - the editor would stay unable to pick parts.
+            if (bisectMode || bisectUnlockFrames > 0)
+                ExitBisectMode();
         }
 
         public void CalcBase(int fieldID) //Calculate Geometry from angle ,originally by Rynco Lee modified by tetraflon, higher precision is required for angle calculations thus use Math double
@@ -3434,9 +3648,16 @@ namespace WingProcedural
                 Vector3.Dot(EditorLogic.SortedShipList[0].transform.right, part.transform.position - EditorLogic.SortedShipList[0].transform.position) < 0
             ;
 
+            CompensateMirrorSideChange();
+
             isAttached = true;
             UpdateGeometry(true);
             SetupMirroredCntrlSrf();
+
+            // Whatever this control was following before, it now sits where the user just
+            // put it; the next follow pass captures that instead of applying old fractions.
+            fpInit = false;
+            fpApplied = false;
 
             if (HighLogic.CurrentGame.Parameters.CustomParams<WPDebug>().logEvents)
             {
@@ -4347,6 +4568,12 @@ namespace WingProcedural
 
         private void SetupMeshFilters()
         {
+            // Called on every RefreshGeometry; without this the lists grow by a full set
+            // per call (readers that index [0, count) never noticed, but anything that
+            // walks the whole list did).
+            meshFiltersWingEdgeTrailing.Clear();
+            meshFiltersWingEdgeLeading.Clear();
+            meshFiltersCtrlEdge.Clear();
             if (!isCtrlSrf)
             {
                 meshFilterWingSurface = CheckMeshFilter(meshFilterWingSurface, "surface");
@@ -5640,7 +5867,7 @@ namespace WingProcedural
                     }
                 }
 
-                if (!isCtrlSrf && isAttached)
+                if (!isCtrlSrf && !isWingAsCtrlSrf && isAttached)
                 {
                     if (GUILayout.Button("Split trailing edge into control surface", UIUtility.uiStyleButton))
                     {
