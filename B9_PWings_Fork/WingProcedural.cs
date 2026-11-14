@@ -1426,27 +1426,6 @@ namespace WingProcedural
             fpAppliedLocalRot = part.transform.localRotation;
         }
 
-        // Re-takes this control's slice of the trailing edge now, against the wing as it is, as if the wing had been
-        // idle since. For code that reshapes the control itself (bisect's crop): left to the next pass, any change to
-        // the wing in the same frame - float noise from the attach is enough - re-applies the slice captured before
-        // the edit, which undoes it.
-        private void ResyncFollow()
-        {
-            if (!HighLogic.LoadedSceneIsEditor || !isCtrlSrf || part.parent == null)
-                return;
-            WingProcedural wing = FirstOfTypeOrDefault<WingProcedural>(part.parent.Modules);
-            if (wing == null || wing.isCtrlSrf)
-                return;
-            WingProcedural geo = FollowGeometrySource(wing);
-            fpLen = geo.sharedBaseLength;
-            fpWR = geo.sharedBaseWidthRoot; fpWT = geo.sharedBaseWidthTip;
-            fpOR = geo.sharedBaseOffsetRoot; fpOT = geo.sharedBaseOffsetTip;
-            fpTR = geo.sharedBaseThicknessRoot; fpTT = geo.sharedBaseThicknessTip;
-            fpInit = true;
-            if (CaptureSpanFractions(wing, geo))
-                RecordApplied();
-        }
-
         // Wing thickness at the span stations of this control's two ends. Stations run
         // 0 (wing root) to 1 (tip); the control's center sits at 0.5 + centerFrac and its
         // ends lengthFrac/2 either side. Its root field maps to the end nearer the wing
@@ -1845,15 +1824,11 @@ namespace WingProcedural
             // Inboard cut edge (its tip) takes the original ROOT offset -> inboard stays a
             // constant (rootOff,rootOff) strip.
             CropInboard(this, f, L, cutWidth, rootOffset, cutThk, cutEdge);
-            ResyncFollow();
             foreach (Part p in part.symmetryCounterparts)
             {
                 WingProcedural sym = FirstOfTypeOrDefault<WingProcedural>(p.Modules);
                 if (sym != null)
-                {
                     CropInboard(sym, f, L, cutWidth, rootOffset, cutThk, cutEdge);
-                    sym.ResyncFollow();
-                }
             }
 
             if (EditorLogic.fetch != null)
@@ -1878,7 +1853,13 @@ namespace WingProcedural
 
             if (haveRoot && cs.SpanEndpoints(out Vector3 rootAfter, out Vector3 tipAfter))
                 cs.part.transform.position += rootBefore - rootAfter;
-                cs.part.attPos0 = cs.part.transform.localPosition;
+            cs.part.attPos0 = cs.part.transform.localPosition;
+
+            // The cropped piece is a new slice of the trailing edge: the next follow pass captures it instead of
+            // applying the slice captured before the crop. Left to the follow's own check, any change to the wing in
+            // the same frame - float noise from the attach is enough - re-applies the old slice, undoing the crop.
+            cs.fpInit = false;
+            cs.fpApplied = false;
         }
 
         // Chosen so the outline reads as a bold line without hiding the profile. World
