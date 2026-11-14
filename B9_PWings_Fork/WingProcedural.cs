@@ -1853,7 +1853,13 @@ namespace WingProcedural
 
             if (haveRoot && cs.SpanEndpoints(out Vector3 rootAfter, out Vector3 tipAfter))
                 cs.part.transform.position += rootBefore - rootAfter;
-                cs.part.attPos0 = cs.part.transform.localPosition;
+            cs.part.attPos0 = cs.part.transform.localPosition;
+
+            // The cropped piece is a new slice of the trailing edge: the next follow pass captures it instead of
+            // applying the slice captured before the crop. Left to the follow's own check, any change to the wing in
+            // the same frame - float noise from the attach is enough - re-applies the old slice, undoing the crop.
+            cs.fpInit = false;
+            cs.fpApplied = false;
         }
 
         // Chosen so the outline reads as a bold line without hiding the profile. World
