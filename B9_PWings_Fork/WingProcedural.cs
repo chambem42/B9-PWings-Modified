@@ -1231,7 +1231,9 @@ namespace WingProcedural
 
             // Push an undo step, as the editor does after its own attach; this also fires
             // onEditorShipModified. Firing the event alone left the split off the undo stack.
-            if (EditorLogic.fetch != null)
+            // Not while the control is on the cursor: the step would lack it, and placing
+            // it pushes the editor's own step.
+            if (primary != null)
                 EditorLogic.fetch.SetBackup();
         }
 
@@ -1843,7 +1845,8 @@ namespace WingProcedural
                     CropInboard(sym, f, L, cutWidth, rootOffset, cutThk, cutEdge);
             }
 
-            if (EditorLogic.fetch != null)
+            // Not while the outboard piece is on the cursor; placing it pushes the step.
+            if (primary != null)
                 EditorLogic.fetch.SetBackup();
         }
 
