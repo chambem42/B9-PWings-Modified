@@ -1166,10 +1166,13 @@ namespace WingProcedural
             Func<WingProcedural, Action<WingProcedural>> cfgFor = wing => cs =>
             {
                 cs.sharedBaseLength = splitTELength;
-                // Zero body width: the control is purely the reproduced (curved) trailing
-                // edge, with no flat hinge strip. The wing's te-width covers only the curved
+                // No body: the control is purely the reproduced (curved) trailing edge,
+                // with no flat hinge strip. The wing's te-width covers only the curved
                 // part, so any body chord here would overshoot the original trailing edge.
-                cs.sharedBaseWidthRoot = 0f;
+                // The root width can't go below its limit (the window and handles clamp it
+                // there), so the root's trailing edge gives up that much instead.
+                float minRoot = sharedBaseWidthRootLimits.z;
+                cs.sharedBaseWidthRoot = minRoot;
                 cs.sharedBaseWidthTip = 0f;
                 cs.sharedBaseThicknessRoot = sharedBaseThicknessRoot;
                 cs.sharedBaseThicknessTip = sharedBaseThicknessTip;
@@ -1180,7 +1183,7 @@ namespace WingProcedural
                 // control-surface types are {1 Rounded, 2 Biconvex, 3 Triangular} - i.e.
                 // offset by one - so map the wing's shape to the equivalent ctrl type.
                 cs.sharedEdgeTypeTrailing = Mathf.Clamp(teType - 1f, 1f, 3f);
-                cs.sharedEdgeWidthTrailingRoot = teRoot * splitTeScale;
+                cs.sharedEdgeWidthTrailingRoot = Mathf.Max(0f, teRoot * splitTeScale - minRoot);
                 cs.sharedEdgeWidthTrailingTip = teTip * splitTeScale;
                 CopyTrailingColorToAll(wing.part, cs.part);
                 CopyFields(wing.part, cs.part, new[] { "massMultiplier" });   // FAR mass-strength
