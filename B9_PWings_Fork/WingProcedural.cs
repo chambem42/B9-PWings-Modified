@@ -1069,11 +1069,27 @@ namespace WingProcedural
         // on its own wing using the fields of the wing the follow reads from.
         private static Vector3 TrailingEdgeMidspanWorld(WingProcedural geo, Transform t)
         {
-            float rootTZ = geo.sharedBaseWidthRoot * 0.5f - geo.sharedBaseOffsetRoot;
-            float tipTZ = geo.sharedBaseWidthTip * 0.5f + geo.sharedBaseOffsetTip;
+            TrailingEdgeTZ(geo, out float rootTZ, out float tipTZ);
             float midTZ = (rootTZ + tipTZ) * 0.5f;
             Vector3 local = new Vector3(geo.sharedBaseLength * 0.5f, -midTZ, 0f);
             return t.position + t.rotation * local;
+        }
+
+        // How far aft of the wing's origin its trailing edge sits at the root and at the
+        // tip (along local -Y), in B9's asymmetric offset convention: width/2 -/+ offset.
+        private static void TrailingEdgeTZ(WingProcedural geo, out float rootTZ, out float tipTZ)
+        {
+            rootTZ = geo.sharedBaseWidthRoot * 0.5f - geo.sharedBaseOffsetRoot;
+            tipTZ = geo.sharedBaseWidthTip * 0.5f + geo.sharedBaseOffsetTip;
+        }
+
+        // The trailing edge's length, and how much further aft it sits at the root than
+        // at the tip (dTZ); on a swept wing the edge is the hypotenuse of span and dTZ.
+        private static float TrailingEdgeLength(WingProcedural geo, out float dTZ)
+        {
+            TrailingEdgeTZ(geo, out float rootTZ, out float tipTZ);
+            dTZ = rootTZ - tipTZ;
+            return Mathf.Sqrt(geo.sharedBaseLength * geo.sharedBaseLength + dTZ * dTZ);
         }
 
         // Rotation for a control surface attached to a wing's trailing edge: the wing's
@@ -1088,9 +1104,8 @@ namespace WingProcedural
         // other by checking that KSP's own mirror of it comes out identical.
         private static Quaternion CtrlSrfRotationForWing(WingProcedural wing)
         {
-            float rootTZ = wing.sharedBaseWidthRoot * 0.5f - wing.sharedBaseOffsetRoot;
-            float tipTZ = wing.sharedBaseWidthTip * 0.5f + wing.sharedBaseOffsetTip;
-            float tilt = Mathf.Atan2(rootTZ - tipTZ, wing.sharedBaseLength) * Mathf.Rad2Deg;
+            TrailingEdgeLength(wing, out float dTZ);
+            float tilt = Mathf.Atan2(dTZ, wing.sharedBaseLength) * Mathf.Rad2Deg;
             Quaternion rot = wing.part.transform.rotation * Quaternion.AngleAxis(tilt, Vector3.forward);
             if (wing.isMirrored)
                 rot *= Quaternion.AngleAxis(180f, Vector3.up);
@@ -1139,13 +1154,8 @@ namespace WingProcedural
             // The control surface spans the wing's TRAILING EDGE, which on a swept wing
             // is longer than the span: its length is the hypotenuse of the span and the
             // chordwise travel of the trailing edge (root TE Z - tip TE Z). Verified to
-            // <1% against two hand-fixed reference crafts. (rootTZ/tipTZ use B9's own
-            // asymmetric offset convention: TE chord(Z) = width/2 -/+ offset.)
-            float splitRootTZ = sharedBaseWidthRoot * 0.5f - sharedBaseOffsetRoot;
-            float splitTipTZ = sharedBaseWidthTip * 0.5f + sharedBaseOffsetTip;
-            float splitDeltaTZ = splitRootTZ - splitTipTZ;
-            float splitTELength = Mathf.Sqrt(sharedBaseLength * sharedBaseLength
-                                           + splitDeltaTZ * splitDeltaTZ);
+            // <1% against two hand-fixed reference crafts.
+            float splitTELength = TrailingEdgeLength(this, out float splitDeltaTZ);
             // Constant offset that keeps the raked control's edges parallel to the wing.
             // Regressed from 4 hand-fixed crafts (0-49deg sweep, lengths 2.0-4.6): the
             // offset is -tan(TE sweep) = -deltaTZ/length, size-independent (R^2=0.998).
@@ -1462,14 +1472,11 @@ namespace WingProcedural
         // Z = thickness. That's the convention the gizmo drag code and
         // TrailingEdgeMidspanWorld use - NOT the mesh builder's frame (which is
         // X=thickness, Y=chord, Z=span; the mesh child is rotated relative to the part).
-        private void TrailingEdgeFrame(WingProcedural wing, WingProcedural geo, out Vector3 teMid, out Vector3 teDirLocal, out float teLen, out float dTZ)
+        private static void TrailingEdgeFrame(WingProcedural wing, WingProcedural geo, out Vector3 teMid, out Vector3 teDirLocal, out float teLen, out float dTZ)
         {
-            float rootTZ = geo.sharedBaseWidthRoot * 0.5f - geo.sharedBaseOffsetRoot;
-            float tipTZ = geo.sharedBaseWidthTip * 0.5f + geo.sharedBaseOffsetTip;
-            dTZ = rootTZ - tipTZ;
+            teLen = TrailingEdgeLength(geo, out dTZ);
             teDirLocal = new Vector3(geo.sharedBaseLength, dTZ, 0f).normalized;
             teMid = TrailingEdgeMidspanWorld(geo, wing.part.transform);
-            teLen = Mathf.Sqrt(geo.sharedBaseLength * geo.sharedBaseLength + dTZ * dTZ);
         }
 
         // False when the wing has no span: its "trailing edge" is then just the chordwise
