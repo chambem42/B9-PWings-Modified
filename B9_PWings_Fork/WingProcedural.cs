@@ -2518,7 +2518,7 @@ namespace WingProcedural
             sharedBaseLength = Mathf.Clamp(tip.x, 0.01f, GetLimitsFromType(sharedBaseLengthLimits).y);
             sharedBaseOffsetTip = -tip.y;
 
-            SegSetHome(part);
+            SetAttachHome(part);
 
             // Linked segments keep their exact pose (their own tips are fixed); anything else
             // turns about the fixed tip with this segment.
@@ -2530,7 +2530,7 @@ namespace WingProcedural
                     t.SetPositionAndRotation(k.pos, k.rot);
                 else
                     t.SetPositionAndRotation(tipWorld + turn * (k.pos - tipWorld), turn * k.rot);
-                SegSetHome(k.part);
+                SetAttachHome(k.part);
             }
             kept.Clear();
 
@@ -2592,7 +2592,7 @@ namespace WingProcedural
 
             ct.position = SegAnchorOnParentTip(pt, before, after);
             SegTakeRootFromParentTip(pt, before, after, parentCtrl, ownCtrl, ownEnd);
-            SegSetHome(part);
+            SetAttachHome(part);
             segLast = SegCurrentShape();
         }
 
@@ -2634,23 +2634,6 @@ namespace WingProcedural
             public Quaternion rot;
         }
         private static readonly List<SegKeptPart> segKept = new List<SegKeptPart>();
-
-        /// <summary>
-        /// Make a part's current local pose its attach pose - the editor's home for it, which a
-        /// gizmo reset returns to. The position home is kept apart from any offset the offset
-        /// tool has already applied (attPos), which KSP adds on top of it. The rotation the user
-        /// gave it (attRotation) turns with it, as KSP's rotate gizmo does it: a part picked up is
-        /// held at its attach frame times attRotation, so a stale one would put the part back at
-        /// the dihedral it had before.
-        /// </summary>
-        private static void SegSetHome(Part p)
-        {
-            Transform t = p.transform;
-            Quaternion local = t.localRotation;
-            p.attPos0 = t.localPosition - p.attPos;
-            p.attRotation = p.attRotation * Quaternion.Inverse(p.attRotation0) * local;
-            p.attRotation0 = local;
-        }
 
         /// <summary>c as a trailing-edge control surface attached to a wing, or null.</summary>
         private static WingProcedural SegTrailingCtrl(Part c)
@@ -3243,7 +3226,7 @@ namespace WingProcedural
             right.Normalize();
             ct.rotation = Quaternion.LookRotation(Vector3.Cross(right, up), up);
             ct.position = pt.TransformPoint(new Vector3(p.sharedBaseLength, -p.sharedBaseOffsetTip, 0f));
-            SegSetHome(part);
+            SetAttachHome(part);
 
             InheritBase(p);
             SegRootChordFromParentTip(pt, p.SegCurrentShape());
