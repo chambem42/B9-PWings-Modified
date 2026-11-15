@@ -879,8 +879,9 @@ namespace WingProcedural
             p.transform.SetParent(parentWing.transform, true);
             // The gizmos treat these as the part's home (reset snaps to them) and they
             // persist in the craft; attachPart sets them from the local pose.
+            p.attPos = Vector3.zero;
             p.attPos0 = p.transform.localPosition;
-            p.attRotation0 = p.transform.localRotation;
+            p.attRotation = p.attRotation0 = p.transform.localRotation;
 
             // Link the tree exactly once. Calling both setParent AND addChild adds the
             // child to parent.children twice -> the part appears twice in the vessel
@@ -922,6 +923,19 @@ namespace WingProcedural
 
             Debug.Log("[B9PW] auto-attached " + p.name + " (pid " + p.persistentId + ") to " + parentWing.name);
             return p;
+        }
+
+        // Move an attached part's home to where it now sits, keeping the user's own
+        // adjustments: KSP places a part at attPos0 plus the offset tool's attPos, and the
+        // rotate tool's turn is attRotation relative to attRotation0. A stale attRotation
+        // puts a picked-up part back at its old angle.
+        private static void SetAttachHome(Part p)
+        {
+            Transform t = p.transform;
+            Quaternion local = t.localRotation;
+            p.attPos0 = t.localPosition - p.attPos;
+            p.attRotation = p.attRotation * Quaternion.Inverse(p.attRotation0) * local;
+            p.attRotation0 = local;
         }
 
         // Fallback: hand the pre-configured part to the cursor for a one-click place.
@@ -1289,8 +1303,7 @@ namespace WingProcedural
         private static void HalfTurnAboutChord(Part p)
         {
             p.transform.rotation *= Quaternion.AngleAxis(180f, Vector3.up);
-            p.attPos0 = p.transform.localPosition;
-            p.attRotation0 = p.transform.localRotation;
+            SetAttachHome(p);
         }
 
         #endregion Mirror side
@@ -1523,8 +1536,7 @@ namespace WingProcedural
             // The editor's gizmos treat attPos0/attRotation0 as the part's home (reset
             // snaps back to them), and attachPart sets them from the local pose. Keep
             // them current, or a reset returns the control to wherever the split left it.
-            part.attPos0 = part.transform.localPosition;
-            part.attRotation0 = part.transform.localRotation;
+            SetAttachHome(part);
 
             RecordApplied();
 
@@ -1853,7 +1865,7 @@ namespace WingProcedural
 
             if (haveRoot && cs.SpanEndpoints(out Vector3 rootAfter, out Vector3 tipAfter))
                 cs.part.transform.position += rootBefore - rootAfter;
-            cs.part.attPos0 = cs.part.transform.localPosition;
+            SetAttachHome(cs.part);
 
             // The cropped piece is a new slice of the trailing edge: the next follow pass captures it instead of
             // applying the slice captured before the crop. Left to the follow's own check, any change to the wing in
