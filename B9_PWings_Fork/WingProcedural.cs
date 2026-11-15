@@ -4175,7 +4175,10 @@ namespace WingProcedural
 
             if (parentCtrl && ownCtrl)
             {
-                SegSyncCtrlPair(parentEnd, ownEnd, ct, pt, parentAft, ownAft);
+                // One still catching up with its wing: no reach to read. Keep the last record, so
+                // a change made meanwhile is seen once it is found again.
+                if (parentEnd.cs != null && ownEnd.cs != null)
+                    segCtrlPair = SegSyncCtrlPair(segCtrlPair, parentEnd, ownEnd, ct, pt);
                 return;
             }
 
@@ -4201,54 +4204,94 @@ namespace WingProcedural
             }
         }
 
-        // The two controls last found meeting at this segment's root joint, and each one's chord
-        // depth (body + trailing edge) at its end there, as last seen.
+        // Two controls whose ends meet - at a linked joint, or at a bisect's cut - and each one's
+        // chord depth (body + trailing edge) at its end there, as last seen.
         private struct SegCtrlPair
         {
-            public WingProcedural parentCs, ownCs;
-            public bool parentRoot, ownRoot;
-            public float parentDepth, ownDepth;
+            public SegCtrlEnd a, b;
+            public float aDepth, bDepth;
+
+            public bool Is(SegCtrlEnd x, SegCtrlEnd y) =>
+                a.cs == x.cs && a.rootEnd == x.rootEnd && b.cs == y.cs && b.rootEnd == y.rootEnd;
         }
+        // The controls meeting at this segment's root joint.
         private SegCtrlPair segCtrlPair;
 
         private static float SegCtrlDepth(SegCtrlEnd end) =>
             SegCtrlBodyWidth(end.cs, end.rootEnd) + SegCtrlTeWidth(end.cs, end.rootEnd);
 
         /// <summary>
-        /// Controls on both sides of the joint stand in for both trailing edges there, and meet as
-        /// the edges did: a change to one's chord depth at the joint (its width or trailing-edge
+        /// Two controls meeting end to end stand in for the trailing edge there, and meet as one
+        /// edge would: a change to one's chord depth at the shared end (its width or trailing-edge
         /// handle, or slider) reaches the other, which is resized to reach as far aft. Only a
         /// change to one of them is carried; following its wing never changes a control's depth,
-        /// so a change is an edit. Frames: <paramref name="parentAft"/> is in <paramref name="ct"/>
-        /// (this segment's), <paramref name="ownAft"/> in <paramref name="pt"/> (the parent's).
+        /// so a change is an edit. b is resized in <paramref name="bFrame"/> and a in
+        /// <paramref name="aFrame"/> (at a joint, each the other side's segment). Returns the new
+        /// record of the pair.
         /// </summary>
-        private void SegSyncCtrlPair(SegCtrlEnd parentEnd, SegCtrlEnd ownEnd, Transform ct, Transform pt, float parentAft, float ownAft)
+        private static SegCtrlPair SegSyncCtrlPair(SegCtrlPair last, SegCtrlEnd a, SegCtrlEnd b, Transform bFrame, Transform aFrame)
         {
-            // One still catching up with its wing: no reach to read. Keep the last record, so a
-            // change made meanwhile is seen once it is found again.
-            if (parentEnd.cs == null || ownEnd.cs == null)
-                return;
-            SegCtrlPair last = segCtrlPair;
-            bool samePair = last.parentCs == parentEnd.cs && last.ownCs == ownEnd.cs
-                && last.parentRoot == parentEnd.rootEnd && last.ownRoot == ownEnd.rootEnd;
-            if (samePair)
+            if (last.Is(a, b))
             {
-                bool parentEdited = SegDiffers(SegCtrlDepth(parentEnd), last.parentDepth);
-                bool ownEdited = SegDiffers(SegCtrlDepth(ownEnd), last.ownDepth);
-                if (parentEdited && !ownEdited)
-                    SegSetCtrlAft(ownEnd, ct, parentAft);
-                else if (ownEdited && !parentEdited)
-                    SegSetCtrlAft(parentEnd, pt, ownAft);
+                bool aEdited = SegDiffers(SegCtrlDepth(a), last.aDepth);
+                bool bEdited = SegDiffers(SegCtrlDepth(b), last.bDepth);
+                if (aEdited && !bEdited)
+                    SegSetCtrlAft(b, bFrame, bFrame.InverseTransformPoint(SegCtrlTrailingCorner(a.cs, a.rootEnd)).y);
+                else if (bEdited && !aEdited)
+                    SegSetCtrlAft(a, aFrame, aFrame.InverseTransformPoint(SegCtrlTrailingCorner(b.cs, b.rootEnd)).y);
             }
-            segCtrlPair = new SegCtrlPair
+            return new SegCtrlPair { a = a, b = b, aDepth = SegCtrlDepth(a), bDepth = SegCtrlDepth(b) };
+        }
+
+        // The controls on this wing meeting end to end (a bisect's pieces), as last seen.
+        private readonly List<SegCtrlPair> segCutPairs = new List<SegCtrlPair>();
+        private static readonly List<SegCtrlPair> segCutPairsNow = new List<SegCtrlPair>();
+        private static readonly List<WingProcedural> segCutCtrls = new List<WingProcedural>();
+
+        /// <summary>
+        /// Trailing-edge controls on this wing that meet end to end - a bisected control's two
+        /// pieces, or two placed side by side - keep their depths matched at the shared end, as
+        /// two controls do across a linked joint. They meet where their hinge corners do; their
+        /// other ends must lie on opposite sides, so two controls laid over each other are not a
+        /// pair.
+        /// </summary>
+        private void SegSyncCtrlCuts()
+        {
+            if (!SegBusy || !SegLinkEnabled || isCtrlSrf || isWingAsCtrlSrf)
+                return;
+            segCutCtrls.Clear();
+            foreach (Part c in part.children)
             {
-                parentCs = parentEnd.cs,
-                ownCs = ownEnd.cs,
-                parentRoot = parentEnd.rootEnd,
-                ownRoot = ownEnd.rootEnd,
-                parentDepth = SegCtrlDepth(parentEnd),
-                ownDepth = SegCtrlDepth(ownEnd)
-            };
+                WingProcedural cs = c != null ? SegTrailingCtrl(c) : null;
+                if (cs != null)
+                    segCutCtrls.Add(cs);
+            }
+            if (segCutCtrls.Count < 2)
+            {
+                segCutPairs.Clear();
+                return;
+            }
+            float tol = SegCtrlPlaneTol(this);
+            segCutPairsNow.Clear();
+            for (int i = 0; i < segCutCtrls.Count; ++i)
+                for (int j = i + 1; j < segCutCtrls.Count; ++j)
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        var a = new SegCtrlEnd { cs = segCutCtrls[i], rootEnd = (k & 1) == 0 };
+                        var b = new SegCtrlEnd { cs = segCutCtrls[j], rootEnd = (k & 2) == 0 };
+                        Vector3 at = SegCtrlHingeCorner(a.cs, a.rootEnd);
+                        if ((SegCtrlHingeCorner(b.cs, b.rootEnd) - at).magnitude > tol)
+                            continue;
+                        if (Vector3.Dot(SegCtrlHingeCorner(a.cs, !a.rootEnd) - at, SegCtrlHingeCorner(b.cs, !b.rootEnd) - at) >= 0f)
+                            continue;
+                        SegCtrlPair last = default(SegCtrlPair);
+                        foreach (SegCtrlPair r in segCutPairs)
+                            if (r.Is(a, b))
+                                last = r;
+                        segCutPairsNow.Add(SegSyncCtrlPair(last, a, b, part.transform, part.transform));
+                    }
+            segCutPairs.Clear();
+            segCutPairs.AddRange(segCutPairsNow);
         }
 
         /// <summary>
@@ -4934,6 +4977,7 @@ namespace WingProcedural
             DeformWing();
             SegLinkUpdate();
             SegSyncCtrlTrailing();
+            SegSyncCtrlCuts();
             SegUpdateMiter();
             CheckAllFieldValues(out bool updateGeo, out bool updateAero);
             bool updateMiter = SegMiterChanged();
