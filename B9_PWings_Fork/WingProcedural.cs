@@ -1578,6 +1578,11 @@ namespace WingProcedural
         private static readonly List<Vector3> xsecVerts = new List<Vector3>();
         private static readonly List<int> xsecTris = new List<int>();
         private static readonly List<Color> xsecCols = new List<Color>();
+        private static readonly RaycastHit[] bisectHits = new RaycastHit[64];
+        // The sliced meshes' vertices and triangles, read once per shape (Mesh.vertices and
+        // .triangles copy the arrays on every read). UpdateGeometry drops them.
+        private struct XsecSource { public MeshFilter mf; public Vector3[] v; public int[] tris; }
+        private List<XsecSource> xsecSources;
 
         private void ToggleBisectMode()
         {
@@ -1604,6 +1609,7 @@ namespace WingProcedural
             bisectMode = false;
             InputLockManager.RemoveControlLock("B9PWBisect");
             HideBisectOverlay();
+            xsecSources = null;
         }
 
         private void BisectUpdate()
@@ -1663,8 +1669,10 @@ namespace WingProcedural
             Ray ray = cam.ScreenPointToRay(Input.mousePosition);
             bool found = false;
             float best = float.MaxValue;
-            foreach (RaycastHit h in Physics.RaycastAll(ray, 2000f))
+            int n = Physics.RaycastNonAlloc(ray, bisectHits, 2000f);
+            for (int i = 0; i < n; i++)
             {
+                RaycastHit h = bisectHits[i];
                 if (h.collider != null && h.collider.transform.IsChildOf(part.transform) && h.distance < best)
                 {
                     hit = h.point; normal = h.normal; best = h.distance; found = true;
@@ -1895,12 +1903,19 @@ namespace WingProcedural
         // cross-section outline as a camera-facing ribbon that shows through the part.
         private void ShowCrossSection(Vector3 planePoint, Vector3 planeNormal, Vector3 camPos)
         {
+            if (xsecSources == null)
+            {
+                xsecSources = new List<XsecSource>();
+                AddXsecSource(meshFilterCtrlFrame);
+                AddXsecSource(meshFilterCtrlSurface);
+                if (meshFiltersCtrlEdge != null)
+                    foreach (MeshFilter e in meshFiltersCtrlEdge)
+                        AddXsecSource(e);
+            }
             xsecSegs.Clear();
-            SliceMesh(meshFilterCtrlFrame, planePoint, planeNormal, xsecSegs);
-            SliceMesh(meshFilterCtrlSurface, planePoint, planeNormal, xsecSegs);
-            if (meshFiltersCtrlEdge != null)
-                foreach (MeshFilter e in meshFiltersCtrlEdge)
-                    SliceMesh(e, planePoint, planeNormal, xsecSegs);
+            foreach (XsecSource s in xsecSources)
+                if (s.mf != null && s.mf.gameObject.activeInHierarchy)
+                    SliceMesh(s.mf.transform, s.v, s.tris, planePoint, planeNormal, xsecSegs);
 
             if (xsecSegs.Count < 2)
             {
@@ -1940,15 +1955,14 @@ namespace WingProcedural
             xsecMesh.RecalculateBounds();
         }
 
-        private static void SliceMesh(MeshFilter mf, Vector3 p, Vector3 n, List<Vector3> segs)
+        private void AddXsecSource(MeshFilter mf)
         {
-            if (mf == null || mf.sharedMesh == null || !mf.gameObject.activeInHierarchy)
-                return;
+            if (mf != null && mf.sharedMesh != null)
+                xsecSources.Add(new XsecSource { mf = mf, v = mf.sharedMesh.vertices, tris = mf.sharedMesh.triangles });
+        }
 
-            Mesh m = mf.sharedMesh;
-            Vector3[] v = m.vertices;
-            int[] tris = m.triangles;
-            Transform t = mf.transform;
+        private static void SliceMesh(Transform t, Vector3[] v, int[] tris, Vector3 p, Vector3 n, List<Vector3> segs)
+        {
             for (int i = 0; i < tris.Length; i += 3)
             {
                 Vector3 a = t.TransformPoint(v[tris[i]]);
@@ -1968,18 +1982,24 @@ namespace WingProcedural
         {
             if (xsecObj != null)
                 return;
+            // A scene change destroys the overlay object but not the mesh or the material,
+            // so those are made once and reused.
             xsecObj = new GameObject("B9PW_BisectXSection");
             xsecFilter = xsecObj.AddComponent<MeshFilter>();
             MeshRenderer mr = xsecObj.AddComponent<MeshRenderer>();
-            xsecMesh = new Mesh { name = "B9PW_BisectXSection" };
+            if (xsecMesh == null)
+                xsecMesh = new Mesh { name = "B9PW_BisectXSection", hideFlags = HideFlags.DontUnloadUnusedAsset };
             xsecFilter.sharedMesh = xsecMesh;
 
-            Shader sh = Shader.Find("Hidden/Internal-Colored");
-            xsecMat = new Material(sh) { hideFlags = HideFlags.HideAndDontSave };
-            xsecMat.SetInt("_ZTest", (int)UnityEngine.Rendering.CompareFunction.Always); // draw through parts
-            xsecMat.SetInt("_ZWrite", 0);
-            xsecMat.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Off);
-            xsecMat.SetColor("_Color", Color.white);
+            if (xsecMat == null)
+            {
+                Shader sh = Shader.Find("Hidden/Internal-Colored");
+                xsecMat = new Material(sh) { hideFlags = HideFlags.HideAndDontSave };
+                xsecMat.SetInt("_ZTest", (int)UnityEngine.Rendering.CompareFunction.Always); // draw through parts
+                xsecMat.SetInt("_ZWrite", 0);
+                xsecMat.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Off);
+                xsecMat.SetColor("_Color", Color.white);
+            }
             mr.sharedMaterial = xsecMat;
             mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
             mr.receiveShadows = false;
@@ -2572,6 +2592,7 @@ namespace WingProcedural
             }
 
             float geometricLength = sharedBaseLength / part.rescaleFactor;
+            xsecSources = null;
 
             if (!isCtrlSrf)
             {
