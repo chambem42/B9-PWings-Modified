@@ -694,8 +694,12 @@ namespace WingProcedural
             sharedBaseThicknessRoot = parent.sharedBaseThicknessTip;
 
             float tip = sharedBaseWidthRoot + ((parent.sharedBaseWidthTip - parent.sharedBaseWidthRoot) / (parent.sharedBaseLength)) * sharedBaseLength;
-            if (sharedBaseWidthTip < 0)
-                sharedBaseLength *= sharedBaseWidthRoot / (sharedBaseWidthRoot - sharedBaseWidthTip);
+            // Past the point where the parent's taper reaches zero chord: end the wing there.
+            if (tip < 0)
+            {
+                sharedBaseLength *= sharedBaseWidthRoot / (sharedBaseWidthRoot - tip);
+                tip = 0f;
+            }
             float offset = sharedBaseLength / parent.sharedBaseLength * parent.sharedBaseOffsetTip;
             sharedBaseWidthTip = tip;
             sharedBaseOffsetTip = offset;
