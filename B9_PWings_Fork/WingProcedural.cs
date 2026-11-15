@@ -1393,6 +1393,11 @@ namespace WingProcedural
             if (wing == null || wing.isCtrlSrf)
                 return;
             WingProcedural geo = FollowGeometrySource(wing);
+            // An edit to the wing not yet carried across its joints: the wing moves this control
+            // once it has (SegFollowAllCtrls). Following it before then, the joints would be read
+            // with the control already off the wing's old shape.
+            if (geo.SegEditPending())
+                return;
 
             bool changed =
                 geo.sharedBaseLength != fpLen
@@ -1434,16 +1439,28 @@ namespace WingProcedural
         // fraction ratcheted down a little per drag step. Reading one wing makes both
         // sides' fields bit-identical, so the sync is a no-op. Pose still comes from each
         // control's own wing transform.
+        // While one of them is being edited, though, that one: the others get its values only
+        // at the end of its Update, and the controls follow it within that Update (see
+        // SegFollowAllCtrls). Once the edit ends they all hold the same values again.
         private WingProcedural FollowGeometrySource(WingProcedural wing)
         {
+            if (wing.state != 0)
+                return wing;
             WingProcedural geo = wing;
+            WingProcedural target = wing.part.GetInstanceID() == uiInstanceIDTarget ? wing : null;
             foreach (Part p in wing.part.symmetryCounterparts)
             {
                 WingProcedural c = FirstOfTypeOrDefault<WingProcedural>(p.Modules);
-                if (c != null && c.GetInstanceID() < geo.GetInstanceID())
+                if (c == null)
+                    continue;
+                if (c.state != 0)
+                    return c;
+                if (p.GetInstanceID() == uiInstanceIDTarget)
+                    target = c;
+                if (c.GetInstanceID() < geo.GetInstanceID())
                     geo = c;
             }
-            return geo;
+            return target ?? geo;
         }
 
         private bool ControlEditedSinceApplied()
@@ -2075,7 +2092,6 @@ namespace WingProcedural
         private static int segGestureTickFrame = -1;
         private static int segDeformFrame = -1;
         private static bool segGestureActive = false;
-        private static int segGestureEndFrame = -1;
         private static int segGestureInputFrame = -1;
         private int segFixedSerial = -1;
         private Vector3 segFixedTip;
@@ -2174,6 +2190,15 @@ namespace WingProcedural
         private const float segEditEpsilon = 1e-4f;
 
         private static bool SegDiffers(float a, float b) => Mathf.Abs(a - b) > segEditEpsilon;
+
+        /// <summary>Whether this wing's root or tip has changed since SegLinkUpdate last took its shape.</summary>
+        private bool SegEditPending()
+        {
+            if (!segInit)
+                return false;
+            SegShape now = SegCurrentShape();
+            return SegTipChanged(segLast, now) || SegRootChanged(segLast, now);
+        }
 
         private static bool SegTipChanged(SegShape a, SegShape b)
         {
@@ -2344,8 +2369,6 @@ namespace WingProcedural
             bool active = frame - segGestureInputFrame <= 1 || frame - segDeformFrame <= 1;
             if (active && !segGestureActive)
                 ++segGestureSerial;
-            if (!active && segGestureActive)
-                segGestureEndFrame = frame;
             segGestureActive = active;
             if (active)
                 SegMarkBusy();
@@ -2394,6 +2417,8 @@ namespace WingProcedural
                         if (w != null)
                             w.segLast = now;
                     }
+                    segLast = now;
+                    SegFollowAllCtrls();
                 }
             }
 
@@ -2413,6 +2438,23 @@ namespace WingProcedural
             segLast.thR = now.thR;
             segLast.leR = now.leR;
             segLast.teR = now.teR;
+        }
+
+        /// <summary>
+        /// Bring every control surface up to date with its wing now, after an edit has been carried
+        /// across the joints, rather than in the control's own Update - which may already have run
+        /// this frame. Every joint is then read with the controls where their wings put them.
+        /// </summary>
+        private static void SegFollowAllCtrls()
+        {
+            if (EditorLogic.fetch == null || EditorLogic.fetch.ship == null)
+                return;
+            foreach (Part p in EditorLogic.fetch.ship.parts)
+            {
+                WingProcedural cs = SegTrailingCtrl(p);
+                if (cs != null)
+                    cs.FollowParentWing();
+            }
         }
 
         private static void SegApply(WingProcedural w, SegShape before, SegShape after, bool tip, bool root)
@@ -2614,8 +2656,8 @@ namespace WingProcedural
         /// <summary>
         /// This segment's root takes its parent's new tip: chord, thickness and edges. A trailing-edge
         /// control surface at the joint stands in for its side's trailing edge (parentCtrl/ownCtrl,
-        /// looked up on the pre-edit shapes, before the control - which follows its wing a frame
-        /// later - has moved); the parent's trailing-edge change then resizes this side's control.
+        /// looked up on the pre-edit shapes, before the controls follow the edit - see
+        /// SegFollowAllCtrls); the parent's trailing-edge change then resizes this side's control.
         /// </summary>
         private void SegTakeRootFromParentTip(Transform pt, SegShape before, SegShape after, bool parentCtrl, bool ownCtrl, SegCtrlEnd ownEnd)
         {
@@ -2624,7 +2666,7 @@ namespace WingProcedural
             sharedEdgeWidthLeadingRoot = after.leT;
             if (!parentCtrl && !ownCtrl)
                 sharedEdgeWidthTrailingRoot = after.teT;
-            else if (ownCtrl && !parentCtrl && ownEnd.cs != null && after.teT != before.teT)
+            else if (ownCtrl && !parentCtrl && after.teT != before.teT)
                 SegSetCtrlAft(ownEnd, pt, SegTipTeY(after) - after.teT);
         }
 
@@ -2713,7 +2755,7 @@ namespace WingProcedural
             p.sharedEdgeWidthLeadingTip = after.leR;
             if (!parentCtrl && !ownCtrl)
                 p.sharedEdgeWidthTrailingTip = after.teR;
-            else if (parentCtrl && !ownCtrl && parentEnd.cs != null && after.teR != before.teR)
+            else if (parentCtrl && !ownCtrl && after.teR != before.teR)
                 SegSetCtrlAft(parentEnd, wt, SegRootTeY(after) - after.teR);
 
             SegShape pAfter = p.SegCurrentShape();
@@ -2792,62 +2834,13 @@ namespace WingProcedural
             return found;
         }
 
-        // The control last found at a segment's root or tip: on which frame, and for which gesture
-        // (one found between gestures counts for the next).
-        private struct SegCtrlSighting
-        {
-            public WingProcedural cs;
-            public int frame, gesture;
-        }
-        private SegCtrlSighting segCtrlSeenRoot, segCtrlSeenTip;
-
-        // Frames a control may take to catch up with its wing once the wing stops changing. The
-        // last of a handle drag reaches the wing the frame after the drag ends, and its control
-        // the frame after that.
-        private const int segCtrlCatchUpFrames = 3;
-
         /// <summary>
         /// Whether a trailing-edge control stands in for w's trailing edge at its tip (or root),
-        /// for w's shape <paramref name="s"/>: one found ending there (end and aftY as
-        /// SegFindCtrlEnd gives them), or, with w's trailing edge zero there, one found there
-        /// a moment ago, or earlier in the gesture going on or just ended, that is still on w
-        /// (end.cs null). A control follows its wing a frame late, so while the wing changes its
-        /// end can be off the joint, not found for a whole drag; taken for a plain joint then, w
-        /// would be given back a trailing edge under its control.
+        /// for w's shape <paramref name="s"/>: one ending there (end and aftY as SegFindCtrlEnd
+        /// gives them).
         /// </summary>
-        private static bool SegCtrlAtEnd(WingProcedural w, SegShape s, bool atTip, Transform frame, out float aftY, out SegCtrlEnd end)
-        {
-            if (SegFindCtrlEnd(w, atTip ? s.len : 0f, atTip ? SegTipTeY(s) : SegRootTeY(s), frame, out aftY, out end))
-            {
-                var seen = new SegCtrlSighting
-                {
-                    cs = end.cs,
-                    frame = Time.frameCount,
-                    gesture = segGestureActive ? segGestureSerial : segGestureSerial + 1
-                };
-                if (atTip)
-                    w.segCtrlSeenTip = seen;
-                else
-                    w.segCtrlSeenRoot = seen;
-                return true;
-            }
-            if ((atTip ? s.teT : s.teR) > segEditEpsilon)
-                return false;
-            // Between gestures a control catches up within a few frames: not found then, it has
-            // left the joint (resized, moved, removed) and the sighting is dropped.
-            int now = Time.frameCount;
-            SegCtrlSighting last = atTip ? w.segCtrlSeenTip : w.segCtrlSeenRoot;
-            bool thisGesture = last.gesture == segGestureSerial
-                && (segGestureActive || now - segGestureEndFrame <= segCtrlCatchUpFrames);
-            if (last.cs != null && last.cs.part.parent == w.part
-                && (now - last.frame <= segCtrlCatchUpFrames || thisGesture))
-                return true;
-            if (atTip)
-                w.segCtrlSeenTip = default(SegCtrlSighting);
-            else
-                w.segCtrlSeenRoot = default(SegCtrlSighting);
-            return false;
-        }
+        private static bool SegCtrlAtEnd(WingProcedural w, SegShape s, bool atTip, Transform frame, out float aftY, out SegCtrlEnd end) =>
+            SegFindCtrlEnd(w, atTip ? s.len : 0f, atTip ? SegTipTeY(s) : SegRootTeY(s), frame, out aftY, out end);
 
         /// <summary>
         /// Resize the control's trailing edge at <paramref name="end"/> so its trailing corner
@@ -2898,12 +2891,19 @@ namespace WingProcedural
             return false;
         }
 
+        /// <summary>
+        /// Whether w's controls are where w puts them: they wait while the wing they follow has an
+        /// edit not yet carried across its joints (see FollowParentWing), and w's joints are not
+        /// read meanwhile.
+        /// </summary>
+        private bool SegCtrlsCurrent(WingProcedural w) => !FollowGeometrySource(w).SegEditPending();
+
         private void SegSyncCtrlTrailing()
         {
             if (!SegBusy || !SegLinkEnabled)
                 return;
             WingProcedural p = SegLinkedParent();
-            if (p == null)
+            if (p == null || !SegCtrlsCurrent(p) || !SegCtrlsCurrent(this))
                 return;
             SegShape ps = p.SegCurrentShape();
             SegShape cs = SegCurrentShape();
@@ -2914,16 +2914,11 @@ namespace WingProcedural
 
             if (parentCtrl && ownCtrl)
             {
-                // One still catching up with its wing: no reach to read. Keep the last record, so
-                // a change made meanwhile is seen once it is found again.
-                if (parentEnd.cs != null && ownEnd.cs != null)
-                    segCtrlPair = SegSyncCtrlPair(segCtrlPair, parentEnd, ownEnd, ct, pt);
+                segCtrlPair = SegSyncCtrlPair(segCtrlPair, parentEnd, ownEnd, ct, pt);
                 return;
             }
 
-            // Only a control found at the joint gives a reach to match; one standing in while it
-            // catches up with its wing just blocks the other side from being changed.
-            if (parentCtrl && parentEnd.cs != null && !ownCtrl && !SegTrailingEditPending(this, root: true))
+            if (parentCtrl && !ownCtrl && !SegTrailingEditPending(this, root: true))
             {
                 float te = Mathf.Max(SegRootTeY(cs) - parentAft, 0f);
                 if (Mathf.Abs(te - sharedEdgeWidthTrailingRoot) > 1e-3f)
@@ -2932,7 +2927,7 @@ namespace WingProcedural
                     segLast.teR = te;
                 }
             }
-            else if (ownCtrl && ownEnd.cs != null && !parentCtrl && !SegTrailingEditPending(p, root: false))
+            else if (ownCtrl && !parentCtrl && !SegTrailingEditPending(p, root: false))
             {
                 float te = Mathf.Max(SegTipTeY(ps) - ownAft, 0f);
                 if (Mathf.Abs(te - p.sharedEdgeWidthTrailingTip) > 1e-3f)
@@ -2996,7 +2991,7 @@ namespace WingProcedural
         /// </summary>
         private void SegSyncCtrlCuts()
         {
-            if (!SegBusy || !SegLinkEnabled || isCtrlSrf || isWingAsCtrlSrf)
+            if (!SegBusy || !SegLinkEnabled || isCtrlSrf || isWingAsCtrlSrf || !SegCtrlsCurrent(this))
                 return;
             segCutCtrls.Clear();
             foreach (Part c in part.children)
