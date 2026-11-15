@@ -2618,6 +2618,14 @@ namespace WingProcedural
         private static Vector3 SegCtrlTrailingCorner(WingProcedural cs, bool rootEnd) =>
             cs.part.transform.TransformPoint(SegCtrlCorner(cs, rootEnd, SegCtrlBodyWidth(cs, rootEnd) + SegCtrlTeWidth(cs, rootEnd)));
 
+        /// <summary>
+        /// A control surface's hinge corner at one end, in world space. Where a control ends along
+        /// the span is told by this corner, not the trailing one: an edit to the end's offset slants
+        /// the end and carries its trailing corner off the joint, but the control still ends there.
+        /// </summary>
+        private static Vector3 SegCtrlHingeCorner(WingProcedural cs, bool rootEnd) =>
+            cs.part.transform.TransformPoint(SegCtrlCorner(cs, rootEnd, 0f));
+
         /// <summary>How far off w's root or tip plane a control's end may lie and still end there.</summary>
         private static float SegCtrlPlaneTol(WingProcedural w) => Mathf.Max(0.05f, 0.01f * w.sharedBaseLength);
 
@@ -2626,8 +2634,8 @@ namespace WingProcedural
         {
             Transform wt = w.part.transform;
             float tol = SegCtrlPlaneTol(w);
-            return Mathf.Abs(wt.InverseTransformPoint(SegCtrlTrailingCorner(cs, true)).x - planeX) <= tol
-                || Mathf.Abs(wt.InverseTransformPoint(SegCtrlTrailingCorner(cs, false)).x - planeX) <= tol;
+            return Mathf.Abs(wt.InverseTransformPoint(SegCtrlHingeCorner(cs, true)).x - planeX) <= tol
+                || Mathf.Abs(wt.InverseTransformPoint(SegCtrlHingeCorner(cs, false)).x - planeX) <= tol;
         }
 
         /// <summary>
@@ -2735,9 +2743,10 @@ namespace WingProcedural
                 for (int k = 0; k < 2; ++k)
                 {
                     bool rootEnd = k == 0;
+                    if (Mathf.Abs(wt.InverseTransformPoint(SegCtrlHingeCorner(cs, rootEnd)).x - planeX) > tol)
+                        continue;
                     Vector3 corner = SegCtrlTrailingCorner(cs, rootEnd);
-                    Vector3 inWing = wt.InverseTransformPoint(corner);
-                    if (Mathf.Abs(inWing.x - planeX) > tol || inWing.y >= baseTeY - 1e-3f)
+                    if (wt.InverseTransformPoint(corner).y >= baseTeY - 1e-3f)
                         continue;
                     float y = frame.InverseTransformPoint(corner).y;
                     if (y < aftY)
@@ -2871,6 +2880,12 @@ namespace WingProcedural
             bool parentCtrl = SegCtrlAtEnd(p, ps, true, ct, out float parentAft, out SegCtrlEnd parentEnd);
             bool ownCtrl = SegCtrlAtEnd(this, cs, false, pt, out float ownAft, out SegCtrlEnd ownEnd);
 
+            if (parentCtrl && ownCtrl)
+            {
+                SegSyncCtrlPair(parentEnd, ownEnd, ct, pt, parentAft, ownAft);
+                return;
+            }
+
             // Only a control found at the joint gives a reach to match; one standing in while it
             // catches up with its wing just blocks the other side from being changed.
             if (parentCtrl && parentEnd.cs != null && !ownCtrl && !SegTrailingEditPending(this, root: true))
@@ -2891,6 +2906,56 @@ namespace WingProcedural
                     p.segLast.teT = te;
                 }
             }
+        }
+
+        // The two controls last found meeting at this segment's root joint, and each one's chord
+        // depth (body + trailing edge) at its end there, as last seen.
+        private struct SegCtrlPair
+        {
+            public WingProcedural parentCs, ownCs;
+            public bool parentRoot, ownRoot;
+            public float parentDepth, ownDepth;
+        }
+        private SegCtrlPair segCtrlPair;
+
+        private static float SegCtrlDepth(SegCtrlEnd end) =>
+            SegCtrlBodyWidth(end.cs, end.rootEnd) + SegCtrlTeWidth(end.cs, end.rootEnd);
+
+        /// <summary>
+        /// Controls on both sides of the joint stand in for both trailing edges there, and meet as
+        /// the edges did: a change to one's chord depth at the joint (its width or trailing-edge
+        /// handle, or slider) reaches the other, which is resized to reach as far aft. Only a
+        /// change to one of them is carried; following its wing never changes a control's depth,
+        /// so a change is an edit. Frames: <paramref name="parentAft"/> is in <paramref name="ct"/>
+        /// (this segment's), <paramref name="ownAft"/> in <paramref name="pt"/> (the parent's).
+        /// </summary>
+        private void SegSyncCtrlPair(SegCtrlEnd parentEnd, SegCtrlEnd ownEnd, Transform ct, Transform pt, float parentAft, float ownAft)
+        {
+            // One still catching up with its wing: no reach to read. Keep the last record, so a
+            // change made meanwhile is seen once it is found again.
+            if (parentEnd.cs == null || ownEnd.cs == null)
+                return;
+            SegCtrlPair last = segCtrlPair;
+            bool samePair = last.parentCs == parentEnd.cs && last.ownCs == ownEnd.cs
+                && last.parentRoot == parentEnd.rootEnd && last.ownRoot == ownEnd.rootEnd;
+            if (samePair)
+            {
+                bool parentEdited = SegDiffers(SegCtrlDepth(parentEnd), last.parentDepth);
+                bool ownEdited = SegDiffers(SegCtrlDepth(ownEnd), last.ownDepth);
+                if (parentEdited && !ownEdited)
+                    SegSetCtrlAft(ownEnd, ct, parentAft);
+                else if (ownEdited && !parentEdited)
+                    SegSetCtrlAft(parentEnd, pt, ownAft);
+            }
+            segCtrlPair = new SegCtrlPair
+            {
+                parentCs = parentEnd.cs,
+                ownCs = ownEnd.cs,
+                parentRoot = parentEnd.rootEnd,
+                ownRoot = ownEnd.rootEnd,
+                parentDepth = SegCtrlDepth(parentEnd),
+                ownDepth = SegCtrlDepth(ownEnd)
+            };
         }
 
         /// <summary>
