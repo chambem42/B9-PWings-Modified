@@ -883,10 +883,20 @@ namespace WingProcedural
 
         private int sweepExternalFlapLevel = -1;
 
-        // Default from the part cfg (MM-patchable), then per-wing in the PAW.
+        // Per wing, set in the PAW. Unset (0) on a new part until RefreshSweepPAW gives it
+        // defaultSweepRate; RefreshSweepPAW also caps the slider and value at maxSweepRate.
         [KSPField(isPersistant = true, guiActive = false, guiActiveEditor = true, guiName = "Move speed", guiFormat = "F1", guiUnits = " deg/s"),
-         UI_FloatRange(minValue = 1f, maxValue = 30f, stepIncrement = 0.5f, scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.All)]
-        public float sweepRate = 8f;
+         UI_FloatRange(minValue = MinSweepRate, maxValue = 30f, stepIncrement = 0.5f, scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.All)]
+        public float sweepRate = 0f;
+
+        // Move speed a new wing starts with, and the most the slider allows. Part cfg (MM-patchable).
+        [KSPField]
+        public float defaultSweepRate = 8f; // deg/s
+
+        [KSPField]
+        public float maxSweepRate = 30f; // deg/s
+
+        private const float MinSweepRate = 1f; // deg/s
 
         [KSPEvent(guiActive = true, guiActiveEditor = false, guiName = "Increase flap deflection", active = true)]
         public void SweepFlapMore()
@@ -1000,6 +1010,18 @@ namespace WingProcedural
                 range.maxValue = limit;
             }
             sharedMaxSweepAngle = Mathf.Clamp(sharedMaxSweepAngle, -limit, limit);
+
+            float maxRate = Mathf.Max(MinSweepRate, maxSweepRate);
+            if (Fields[nameof(sweepRate)].uiControlEditor is UI_FloatRange rateRange)
+            {
+                rateRange.maxValue = maxRate;
+            }
+            if (sweepRate <= 0f)
+            {
+                sweepRate = defaultSweepRate;
+            }
+            sweepRate = Mathf.Clamp(sweepRate, MinSweepRate, maxRate);
+
             Fields[nameof(sharedMaxSweepAngle)].guiActiveEditor = on;
             Fields[nameof(sweepRate)].guiActiveEditor = on;
             Fields[nameof(sweepPreviewPercent)].guiActiveEditor = on;
