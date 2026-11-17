@@ -4,7 +4,9 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using UnityEngine;
+using CompoundParts;
 using KSP.Localization;
+using KSP.UI.TooltipTypes;
 using UnityEngine.Internal;
 using UnityEngine.Scripting;
 
@@ -801,11 +803,26 @@ namespace WingProcedural
         // Part-local frame is X = span, Y = chord (trailing edge at -Y), Z = thickness.
         private Vector3 SweepAxisLocal => sweepMode == SweepModeFold ? Vector3.up : Vector3.forward;
 
-        // Declared to the folding maximum; RefreshSweepPAW narrows the slider to 70 in sweep mode,
-        // where more than that stops being a wing at all.
+        // Signed travel at full flaps. Positive sweeps the tip aft / folds it up; negative sweeps it
+        // forward / folds it down. RefreshSweepPAW sets the slider to +/- the mode's limit below.
         [KSPField(isPersistant = true, guiActive = false, guiActiveEditor = true, guiName = "Max sweep", guiFormat = "F0", guiUnits = " deg"),
-         UI_FloatRange(minValue = 0f, maxValue = 90f, stepIncrement = 1f, scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.All)]
+         UI_FloatRange(minValue = -90f, maxValue = 90f, stepIncrement = 1f, scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.All)]
         public float sharedMaxSweepAngle = 45f;
+
+        // Slider limits, per part cfg (MM-patchable). A fold wants to reach vertical; a sweep past
+        // 70 is no longer much of a wing.
+        [KSPField]
+        public float sweepAngleLimit = 70f;
+
+        [KSPField]
+        public float foldAngleLimit = 90f;
+
+        // Total part mass multiplier while Movable is not None - stands in for the pivot, actuators
+        // and stiffening a real swing/fold wing carries. Cfg only; 1 = no penalty.
+        [KSPField]
+        public float movableMassMultiplier = 1f;
+
+        private float SweepAngleLimit => Mathf.Clamp(sweepMode == SweepModeFold ? foldAngleLimit : sweepAngleLimit, 0f, 180f);
 
         // Editor eyeballing only - deliberately not persistent, so a loaded craft starts unswept.
         [KSPField(guiActive = false, guiActiveEditor = true, guiName = "Preview sweep", guiFormat = "F0", guiUnits = " %"),
@@ -866,8 +883,10 @@ namespace WingProcedural
 
         private int sweepExternalFlapLevel = -1;
 
-        [KSPField]
-        public float sweepRate = 8f; // deg/sec
+        // Default from the part cfg (MM-patchable), then per-wing in the PAW.
+        [KSPField(isPersistant = true, guiActive = false, guiActiveEditor = true, guiName = "Move speed", guiFormat = "F1", guiUnits = " deg/s"),
+         UI_FloatRange(minValue = 1f, maxValue = 30f, stepIncrement = 0.5f, scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.All)]
+        public float sweepRate = 8f;
 
         [KSPEvent(guiActive = true, guiActiveEditor = false, guiName = "Increase flap deflection", active = true)]
         public void SweepFlapMore()
@@ -937,6 +956,10 @@ namespace WingProcedural
         private List<SweepFollower> sweepFollowers;
         private bool sweepAeroDirty;
         private int? sweepPawCached;
+        private readonly SweepPreviewBalance sweepPreviewBalance = new SweepPreviewBalance();
+        private float sweepPreviewFarTimer = -1f;
+        private static int sweepPreviewFarEventFrame = -1;
+        private const float SweepPreviewFarDelay = 0.25f; // s
 
         public bool CanVarySweep => IsPlainWing;
 
@@ -948,9 +971,13 @@ namespace WingProcedural
         /// is open anywhere (uiEditMode is static, deliberately): an edit propagates to the symmetry
         /// counterpart too, and a counterpart still previewing would hold its followers on neutrals
         /// captured before the edit while the editor moves their part transforms underneath.
+        /// Likewise while a part is on the cursor: it is placed against the colliders, which a
+        /// preview has rotated, so it would end up floating once the preview drops.
         /// Suppressed rather than zeroed, so the slider survives the edit.
         /// </summary>
-        private bool SweepPreviewAllowed => isAttached && !uiEditMode;
+        private bool SweepPreviewAllowed => isAttached && !uiEditMode && (EditorLogic.fetch == null || EditorLogic.SelectedPart == null);
+
+        private static int sweepMassEventFrame = -1;
 
         private void RefreshSweepPAW()
         {
@@ -959,16 +986,22 @@ namespace WingProcedural
 
             bool folding = sweepMode == SweepModeFold;
             Fields[nameof(sweepMode)].guiActiveEditor = avail;
+            // Pinned by a strut: Movable shows red (the tooltip says why), and so does the flight readout.
+            Fields[nameof(sweepMode)].guiName = on && sweepPinned ? "<color=#FF4040>Movable (strut)</color>" : "Movable";
             Fields[nameof(sharedMaxSweepAngle)].guiName = folding ? "Max fold" : "Max sweep";
-            Fields[nameof(sweepCurrentAngle)].guiName = folding ? "Fold" : "Sweep";
+            Fields[nameof(sweepCurrentAngle)].guiName = on && sweepPinned
+                                                             ? "<color=#FF4040>Held by strut</color>"
+                                                             : folding ? "Fold" : "Sweep";
 
-            // A fold wants to reach vertical; a sweep past 70 is no longer a wing.
+            float limit = SweepAngleLimit;
             if (Fields[nameof(sharedMaxSweepAngle)].uiControlEditor is UI_FloatRange range)
             {
-                range.maxValue = folding ? 90f : 70f;
-                sharedMaxSweepAngle = Mathf.Min(sharedMaxSweepAngle, range.maxValue);
+                range.minValue = -limit;
+                range.maxValue = limit;
             }
+            sharedMaxSweepAngle = Mathf.Clamp(sharedMaxSweepAngle, -limit, limit);
             Fields[nameof(sharedMaxSweepAngle)].guiActiveEditor = on;
+            Fields[nameof(sweepRate)].guiActiveEditor = on;
             Fields[nameof(sweepPreviewPercent)].guiActiveEditor = on;
             Fields[nameof(sweepCurrentAngle)].guiActive = on;
             Fields[nameof(sweepDriveJoint)].guiActiveEditor = on;
@@ -1143,7 +1176,7 @@ namespace WingProcedural
                 }
                 aeroFARMethodInfoUsed.Invoke(aeroFARModuleReference, null);
 
-                // Deliberately no voxel rebuild here. FAR voxelises the meshes themselves
+                // Deliberately no voxel rebuild here. FAR voxelizes the meshes themselves
                 // (FARVoxPatch sets forceUseMeshes), and on this path the mesh is rotated while the
                 // part transform is not - so rebuilding hands FAR a swept body to compute forces on
                 // while its wing model still sees an unswept one. Those two disagree, and the
@@ -1170,6 +1203,13 @@ namespace WingProcedural
         /// </summary>
         private void UpdateSweepFlight()
         {
+            // A strut across the hinge holds the wing still - see the strut pinning region.
+            CheckSweepPinFlight();
+            if (sweepPinned)
+            {
+                return;
+            }
+
             // Defer to the aircraft's own flaps whenever they move; between those moves the wing's
             // flap setting is whatever its events/actions last put there.
             int ext = VariableSweep.VesselFlapLevel(vessel);
@@ -1194,8 +1234,16 @@ namespace WingProcedural
             float fraction = Mathf.Clamp(sweepFlapLevel, 0, 3) / 3f;
             float target = sharedMaxSweepAngle * (sweepInvertFlaps ? 1f - fraction : fraction);
 
+            // A new target starts a new move: an integral wound up holding the last one against its
+            // load belongs to that pose, and carried over it parks the wing that far off the next.
+            if (target != sweepLastTarget)
+            {
+                sweepLastTarget = target;
+                sweepIntegral = 0f;
+            }
+
             // Joints do not exist while the vessel is packed, and driving one through pack/unpack
-            // is a good way to launch the craft. Fall through to the visual path until unpacked.
+            // is a good way to launch the craft. Until it can be driven the wing waits - see below.
             if (sweepDriveJoint && vessel != null && !vessel.packed && part.rb != null && TrySetupSweepJoint())
             {
                 // The part really rotates, so aero, colliders and CoM come along on their own, and
@@ -1227,26 +1275,64 @@ namespace WingProcedural
                 // that is not really steady-state error, and do not judge the wing while warped.
                 bool physicsWarp = TimeWarp.CurrentRate > 1f && TimeWarp.WarpMode == TimeWarp.Modes.LOW;
 
+                // The setpoint walks toward the target at the player's chosen speed rather than
+                // jumping there, starting from wherever the wing is when the joint is taken over.
+                if (!sweepCommandValid)
+                {
+                    sweepCommand = actual;
+                    sweepCommandValid = true;
+                }
+
+                float step = Mathf.MoveTowards(sweepCommand, target, Mathf.Max(0.1f, sweepRate) * Time.deltaTime);
+
+                // While traversing, it does not advance more than sweepCommandLead ahead of the wing,
+                // so a wing too heavy (or too loaded) for the speed is pushed with a bounded torque
+                // rather than an error that grows for as long as the ramp outruns it. Forward only -
+                // the setpoint never retreats on the wing's account: clamping it both ways let a wing
+                // sagging further than the lead under load drag the setpoint down after it, frame by
+                // frame, away from the target. And not on the final approach: within the integral's
+                // band the setpoint goes to the target and the integral takes up the sag.
+                if (Mathf.Abs(target - actual) > sweepIntegralBand)
+                {
+                    float lead = Mathf.Max(0.5f, sweepCommandLead);
+                    if (step > sweepCommand)
+                    {
+                        step = Mathf.Min(step, Mathf.Max(sweepCommand, actual + lead));
+                    }
+                    else if (step < sweepCommand)
+                    {
+                        step = Mathf.Max(step, Mathf.Min(sweepCommand, actual - lead));
+                    }
+                }
+
+                sweepCommand = step;
+
+                // Integrate only once the ramp has reached the target - while it is still walking,
+                // the lag behind it is the ramp, not steady-state error. (The lead only holds the ramp
+                // back outside the band, where nothing is integrated anyway.)
                 float error = target - actual;
-                if (!physicsWarp && Mathf.Abs(error) < sweepIntegralBand)
+                if (!physicsWarp && Mathf.Abs(target - sweepCommand) < 0.01f && Mathf.Abs(error) < sweepIntegralBand)
                 {
                     sweepIntegral = Mathf.Clamp(sweepIntegral + error * sweepIntegralGain * Time.deltaTime,
                                                 -sweepIntegralLimit, sweepIntegralLimit);
                 }
 
                 // Never command outside the wing's travel by more than the integrator's allowance -
-                // a belt-and-braces stop against the drive walking the wing past neutral.
-                DriveSweepJoint(Mathf.Clamp(target + sweepIntegral,
-                                            -sweepIntegralLimit,
-                                            sharedMaxSweepAngle + sweepIntegralLimit));
+                // a belt-and-braces stop against the drive walking the wing past neutral. Travel
+                // runs from 0 to a max of either sign.
+                DriveSweepJoint(Mathf.Clamp(sweepCommand + sweepIntegral,
+                                            Mathf.Min(0f, sharedMaxSweepAngle) - sweepIntegralLimit,
+                                            Mathf.Max(0f, sharedMaxSweepAngle) + sweepIntegralLimit));
 
                 // The readout, and the reference a rebuilt joint strips to recover its neutral, is
                 // where the wing actually is - not where it was told to go.
                 sweepCurrentAngle = actual;
                 ReportSweepTracking(target, actual);
 
-                // Stalled means short of target AND not moving. Held separately from "still has
-                // work to do", which is what the counterparts coordinate on.
+                // Stalled means short of the target AND not moving. The setpoint is held within the
+                // lead of the wing, so the gap to it never shows a jam; the gap to the target does.
+                // Held separately from "still has work to do", which is what the counterparts
+                // coordinate on.
                 bool shortOfTarget = Mathf.Abs(target - actual) > sweepStallTolerance;
                 if (physicsWarp)
                 {
@@ -1264,7 +1350,10 @@ namespace WingProcedural
 
                     sweepStallTime += Time.deltaTime;
 
-                    if (Mathf.Abs(actual - sweepStallRefAngle) > 1f)
+                    // "Moving" is scaled to the speed setting: at a cfg speed slow enough to cover
+                    // under a degree in the timeout, a fixed one degree would read as a jam.
+                    float moving = Mathf.Min(1f, 0.5f * Mathf.Max(0.1f, sweepRate) * sweepStallTimeout);
+                    if (Mathf.Abs(actual - sweepStallRefAngle) > moving)
                     {
                         sweepStallTime = 0f; // it is moving, just not there yet
                     }
@@ -1306,7 +1395,15 @@ namespace WingProcedural
                         {
                             sweepAeroDirty = false;
                             SetSweepRoboticLock(true);
-                            StartCoroutine(UpdateAeroDelayed());
+                            // FAR models the whole vessel, which the part has moved within. A stock
+                            // drag cube lives in the part's own frame, which the model turned with,
+                            // so rendering it again only gives the same cube - and KSP renders it
+                            // from a copy of the part it then destroys, which TimeControl takes for
+                            // a part lost off the active vessel and cancels hyper-warp over.
+                            if (assemblyFARUsed)
+                            {
+                                StartCoroutine(UpdateAeroDelayed());
+                            }
                         }
                     }
                 }
@@ -1320,6 +1417,18 @@ namespace WingProcedural
             // 30 deg and then "visually" swept to 45 renders at 75 while FAR sees 30. That applies
             // to an abandoned wing and to any frame where the joint is briefly unavailable.
             if (sweepJointCaptured)
+            {
+                return;
+            }
+
+            // Nor may it move a Physics wing that is only waiting for its joint - packed at flight
+            // start, or the joint not built yet. The visual angle would become sweepCurrentAngle,
+            // which taking the joint over strips out of the pose as if the part had turned that far:
+            // a wing loaded with flaps down then settled that many degrees short all flight. The
+            // wing waits unswept instead, and the drive takes it from there. Only a wing that can
+            // never have the joint (the root part has no attach joint) or has given up on it
+            // animates visually.
+            if (sweepDriveJoint && !sweepAbandoned && part.parent != null)
             {
                 return;
             }
@@ -1349,6 +1458,7 @@ namespace WingProcedural
             // so the first pass always refreshes.
             if (sweepPawCached != sweepMode)
             {
+                bool changed = sweepPawCached.HasValue;
                 sweepPawCached = sweepMode;
                 if (!SweepEnabled)
                 {
@@ -1357,9 +1467,147 @@ namespace WingProcedural
 
                 RefreshSweepPAW();
                 UpdateSweepPivotIndicator(); // mode changed - the pivot axis moved with it
+
+                // Movable carries a mass multiplier, so the editor's mass readout must be told -
+                // once, though every symmetry counterpart notices the change in the same frame.
+                if (changed && movableMassMultiplier != 1f && EditorLogic.fetch != null && sweepMassEventFrame != Time.frameCount)
+                {
+                    sweepMassEventFrame = Time.frameCount;
+                    GameEvents.onEditorShipModified.Fire(EditorLogic.fetch.ship);
+                }
             }
 
-            ApplySweepVisual(SweepEnabled && SweepPreviewAllowed ? sharedMaxSweepAngle * sweepPreviewPercent * 0.01f : 0f);
+            UpdateSweepPinEditor();
+            // A pinned wing will not move in flight, so the preview does not pretend it will.
+            float preview = SweepEnabled && !sweepPinned && SweepPreviewAllowed ? sharedMaxSweepAngle * sweepPreviewPercent * 0.01f : 0f;
+            ApplySweepVisual(preview);
+            UpdateSweepPreviewBalance(preview);
+            UpdateSweepTooltips();
+        }
+
+        /// <summary>
+        /// Move the CoM and CoL markers with the preview (see SweepPreviewBalance). The stock
+        /// markers read the offsets every frame; FAR only recomputes its CoL on a ship-modified
+        /// event, which also sets off every other mod listening for one, so that waits until the
+        /// slider has stopped moving.
+        /// </summary>
+        private void UpdateSweepPreviewBalance(float deg)
+        {
+            if (sweepPreviewBalance.Apply(part, deg, SweepRotation(deg), sweepMode != SweepModeFold))
+            {
+                sweepPreviewFarTimer = SweepPreviewFarDelay;
+            }
+
+            if (sweepPreviewFarTimer < 0f)
+            {
+                return;
+            }
+
+            sweepPreviewFarTimer -= Time.unscaledDeltaTime;
+            if (sweepPreviewFarTimer > 0f)
+            {
+                return;
+            }
+
+            sweepPreviewFarTimer = -1f;
+            sweepPreviewBalance.FinishFar();
+            // Once for all the wings that moved together.
+            if (EditorLogic.fetch != null && EditorLogic.fetch.ship != null && sweepPreviewFarEventFrame != Time.frameCount)
+            {
+                sweepPreviewFarEventFrame = Time.frameCount;
+                GameEvents.onEditorShipModified.Fire(EditorLogic.fetch.ship);
+            }
+        }
+
+        // Plain-language hover help for the variable-geometry PAW controls. KSPField has no tooltip
+        // of its own, so KSP's standard text tooltip is attached to each PAW row as it appears.
+        private string SweepTooltipFor(string field)
+        {
+            bool folding = sweepMode == SweepModeFold;
+            switch (field)
+            {
+                case nameof(sweepMode):
+                    return (sweepPinned
+                                ? "<color=#FF4040>A strut ties this wing to the rest of the craft, so it cannot move.</color> "
+                                  + "Remove the strut (shown in red), or only strut it to parts that move with the wing.\n\n"
+                                : string.Empty)
+                           + "Lets this wing move in flight, driven by the flap controls.\n"
+                           + "Sweep angle: the wing swings forward or back at its root.\n"
+                           + "Folding: the wing tilts up or down at its root.";
+                case nameof(sharedMaxSweepAngle):
+                    return folding
+                               ? "How far the wing folds when the flaps are fully down.\nPositive folds the tip up, negative folds it down."
+                               : "How far the wing swings when the flaps are fully down.\nPositive sweeps the tip back, negative sweeps it forward.";
+                case nameof(sweepRate):
+                    return "How fast the wing moves, in degrees per second.";
+                case nameof(sweepPreviewPercent):
+                    return "Shows the wing part of the way through its travel, to check it clears the rest of the craft. Editor only - not saved.";
+                case nameof(sweepDriveJoint):
+                    return "Visual: only the wing's look moves. Steady and cheap.\n"
+                           + "Physics: the whole part moves, so its lift, weight and anything attached move too. More realistic, but the wing is held on less firmly while it moves.";
+                case nameof(sweepInvertFlaps):
+                    return "With flaps: the wing moves out as the flaps go down.\n"
+                           + "Against flaps: the wing starts moved out and comes back as the flaps go down.";
+                default:
+                    return null;
+            }
+        }
+
+        private float sweepTooltipTimer;
+        private static Tooltip_Text sweepTooltipPrefab;
+
+        private void UpdateSweepTooltips()
+        {
+            // Rows come and go as fields are shown and hidden, so poll - slowly, and only while
+            // this part's PAW is actually open.
+            sweepTooltipTimer -= Time.unscaledDeltaTime;
+            if (sweepTooltipTimer > 0f || UIPartActionController.Instance == null)
+            {
+                return;
+            }
+
+            sweepTooltipTimer = 0.5f;
+            UIPartActionWindow window = UIPartActionController.Instance.GetItem(part, false);
+            if (window == null)
+            {
+                return;
+            }
+
+            if (sweepTooltipPrefab == null)
+            {
+                sweepTooltipPrefab = AssetBase.GetPrefab<Tooltip_Text>("Tooltip_Text");
+                if (sweepTooltipPrefab == null)
+                {
+                    return;
+                }
+            }
+
+            List<UIPartActionItem> items = window.ListItems;
+            for (int i = 0; i < items.Count; ++i)
+            {
+                if (!(items[i] is UIPartActionFieldItem item) || item.Field == null || item.PartModule != this)
+                {
+                    continue;
+                }
+
+                string text = SweepTooltipFor(item.Field.name);
+                if (text == null)
+                {
+                    continue;
+                }
+
+                TooltipController_Text tip = item.gameObject.GetComponent<TooltipController_Text>();
+                if (tip == null)
+                {
+                    tip = item.gameObject.AddComponent<TooltipController_Text>();
+                    tip.prefab = sweepTooltipPrefab;
+                }
+
+                if (tip.textString != text)
+                {
+                    tip.SetText(text);
+                }
+            }
         }
 
         private void OnVesselModifiedForSweep(Vessel v)
@@ -1370,17 +1618,216 @@ namespace WingProcedural
             }
 
             sweepFollowers = null;
+            sweepBracingWatch = SweepBracingWatchFrames;
             // Docking, decoupling and collisions rebuild joints, so the survey is stale.
             sweepRestraints = null;
             sweepJointChecked = false;
             sweepUsesJoint = false;
+            // A strut may have broken off, or been added by an engineer.
+            sweepPinChecked = false;
         }
+
+        #region Variable sweep - strut pinning
+
+        // A strut that crosses the hinge - one end on the wing or something it carries, the other on
+        // something it does not - holds the wing still: its anchors sit away from the pivot, so
+        // turning would have to stretch it. Such a wing is not movable. A strut with both ends on
+        // the wing and what it carries (a tip pod, an outboard linked segment) moves with it and is
+        // fine. Pinning one wing pins its symmetry counterparts too, so a strut on one side cannot
+        // leave the aircraft swept on one side only.
+        private bool sweepPinned;
+        private bool sweepPinChecked;
+        private float sweepPinTimer;
+        private Part sweepPinHighlighted;
+        private static float sweepPinMessageTime = -10f;
+
+        private List<Part> SweepShipParts =>
+            HighLogic.LoadedSceneIsEditor
+                ? (EditorLogic.fetch != null && EditorLogic.fetch.ship != null ? EditorLogic.fetch.ship.parts : null)
+                : (vessel != null ? vessel.parts : null);
+
+        private bool CarriedByThisWing(Part p) => p == part || IsDownstreamOfThisWing(p);
+
+        /// <summary>The strut pinning this wing itself, or null.</summary>
+        private Part OwnPinningStrut(List<Part> parts)
+        {
+            for (int i = 0; i < parts.Count; ++i)
+            {
+                if (!(parts[i] is CompoundPart strut) || !strut.Modules.Contains<CModuleStrut>())
+                {
+                    continue;
+                }
+
+                Part a = strut.parent, b = strut.target;
+                if (a != null && b != null && CarriedByThisWing(a) != CarriedByThisWing(b))
+                {
+                    return strut;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>The strut pinning this wing or any of its symmetry counterparts, or null.</summary>
+        private Part GroupPinningStrut()
+        {
+            List<Part> parts = SweepShipParts;
+            if (parts == null || !SweepEnabled || !CanVarySweep)
+            {
+                return null;
+            }
+
+            Part strut = OwnPinningStrut(parts);
+            for (int i = 0; strut == null && i < part.symmetryCounterparts.Count; ++i)
+            {
+                WingProcedural wp = FirstOfTypeOrDefault<WingProcedural>(part.symmetryCounterparts[i].Modules);
+                if (wp != null)
+                {
+                    strut = wp.OwnPinningStrut(parts);
+                }
+            }
+
+            return strut;
+        }
+
+        private static void PostSweepPinMessage()
+        {
+            // Every wing of a symmetry group finds the same strut; say it once.
+            if (Time.unscaledTime - sweepPinMessageTime < 2f)
+            {
+                return;
+            }
+
+            sweepPinMessageTime = Time.unscaledTime;
+            ScreenMessages.PostScreenMessage("A strut ties a movable wing to the rest of the craft - that wing will not move",
+                                             6f, ScreenMessageStyle.UPPER_CENTER);
+        }
+
+        /// <summary>
+        /// Editor: re-check a few times a second (struts come and go without touching this part),
+        /// mark Movable red while pinned, and light the strut up red while this wing's PAW is open.
+        /// </summary>
+        private void UpdateSweepPinEditor()
+        {
+            sweepPinTimer -= Time.unscaledDeltaTime;
+            if (sweepPinTimer <= 0f)
+            {
+                sweepPinTimer = 0.25f;
+                Part strut = GroupPinningStrut();
+                bool pinned = strut != null;
+                if (pinned != sweepPinned)
+                {
+                    sweepPinned = pinned;
+                    RefreshSweepPAW();
+                    if (pinned)
+                    {
+                        PostSweepPinMessage();
+                    }
+                }
+
+                bool pawOpen = UIPartActionController.Instance != null && UIPartActionController.Instance.GetItem(part, false) != null;
+                SetSweepPinHighlight(pinned && pawOpen ? strut : null);
+            }
+        }
+
+        private void SetSweepPinHighlight(Part strut)
+        {
+            if (strut == sweepPinHighlighted)
+            {
+                return;
+            }
+
+            if (sweepPinHighlighted != null)
+            {
+                sweepPinHighlighted.SetHighlightDefault();
+            }
+
+            sweepPinHighlighted = strut;
+            if (strut != null)
+            {
+                strut.SetHighlightColor(Color.red);
+                strut.SetHighlightType(Part.HighlightType.AlwaysOn);
+                strut.SetHighlight(true, false);
+            }
+        }
+
+        /// <summary>
+        /// Flight: re-checked twice a second, and at once whenever the vessel changes (a strut broke
+        /// off, or an engineer added one). Not just once: a strut only finds its target some frames
+        /// after the vessel loads, so the first look sees an unconnected strut. A wing pinned while
+        /// its joint is driven holds where it is.
+        /// </summary>
+        private void CheckSweepPinFlight()
+        {
+            sweepPinTimer -= Time.deltaTime;
+            if (sweepPinChecked && sweepPinTimer > 0f)
+            {
+                return;
+            }
+
+            sweepPinChecked = true;
+            sweepPinTimer = 0.5f;
+            bool pinned = GroupPinningStrut() != null;
+            if (pinned == sweepPinned)
+            {
+                return;
+            }
+
+            sweepPinned = pinned;
+            RefreshSweepPAW();
+            if (pinned)
+            {
+                PostSweepPinMessage();
+                if (sweepJointCaptured && !sweepAbandoned)
+                {
+                    AbandonSweepJoint(MeasuredSweepAngle());
+                }
+            }
+        }
+
+        /// <summary>
+        /// The joints of every strut on the vessel. Bracing removal must never touch these: a strut
+        /// the player ran between parts the wing carries moves with it, and nothing would rebuild it.
+        /// A strut's joint lives on the part at its root end, not on the strut part itself.
+        /// </summary>
+        private HashSet<ConfigurableJoint> StrutJoints()
+        {
+            var joints = new HashSet<ConfigurableJoint>();
+            if (vessel == null)
+            {
+                return joints;
+            }
+
+            for (int i = 0; i < vessel.parts.Count; ++i)
+            {
+                if (!(vessel.parts[i] is CompoundPart))
+                {
+                    continue;
+                }
+
+                CModuleStrut strut = vessel.parts[i].Modules.GetModule<CModuleStrut>();
+                if (strut != null && strut.strutJoint != null && strut.strutJoint.joints != null)
+                {
+                    for (int k = 0; k < strut.strutJoint.joints.Count; ++k)
+                    {
+                        if (strut.strutJoint.joints[k] != null)
+                        {
+                            joints.Add(strut.strutJoint.joints[k]);
+                        }
+                    }
+                }
+            }
+
+            return joints;
+        }
+
+        #endregion Variable sweep - strut pinning
 
         #region Variable sweep - joint drive
 
         // One joint restraining the wing. Only the attach joint is driven; the rest are just made
         // compliant about the sweep axis. The axis is stored per joint because a joint hosted on a
-        // neighbouring part expresses it in that part's frame, not ours.
+        // neighboring part expresses it in that part's frame, not ours.
         private struct SweepRestraint
         {
             public ConfigurableJoint joint;
@@ -1400,6 +1847,9 @@ namespace WingProcedural
         // Sticky for the rest of the flight, and deliberately NOT cleared by the vessel-modified
         // handler - otherwise a wing that gave up re-arms itself a frame later.
         private bool sweepAbandoned;
+        // Surveys in a row that found the attach joint without a usable primary joint.
+        private int sweepJointMissingCount;
+        private const int SweepJointMissingLimit = 50;
 
         /// <summary>
         /// The part's rotation relative to the body its joint connects to. Deliberately not
@@ -1415,7 +1865,7 @@ namespace WingProcedural
         /// was sent to, because it is pushing into a solid object rather than through open air. A
         /// real swing wing gets a glove around the pivot; this is the equivalent.
         ///
-        /// Limited to the immediate neighbourhood - parent, grandparent and siblings - so the wing
+        /// Limited to the immediate neighborhood - parent, grandparent and siblings - so the wing
         /// still collides with the ground and everything else normally.
         /// </summary>
         private void IgnoreSweepRootCollisions()
@@ -1428,23 +1878,23 @@ namespace WingProcedural
             sweepCollisionsIgnored = true;
             Collider[] mine = part.GetComponentsInChildren<Collider>();
 
-            List<Part> neighbours = new List<Part> { part.parent };
+            List<Part> neighbors = new List<Part> { part.parent };
             if (part.parent.parent != null)
             {
-                neighbours.Add(part.parent.parent);
+                neighbors.Add(part.parent.parent);
             }
 
             for (int i = 0; i < part.parent.children.Count; ++i)
             {
                 if (part.parent.children[i] != part)
                 {
-                    neighbours.Add(part.parent.children[i]);
+                    neighbors.Add(part.parent.children[i]);
                 }
             }
 
-            for (int n = 0; n < neighbours.Count; ++n)
+            for (int n = 0; n < neighbors.Count; ++n)
             {
-                Collider[] theirs = neighbours[n].GetComponentsInChildren<Collider>();
+                Collider[] theirs = neighbors[n].GetComponentsInChildren<Collider>();
                 for (int a = 0; a < mine.Length; ++a)
                 {
                     for (int b = 0; b < theirs.Length; ++b)
@@ -1459,7 +1909,7 @@ namespace WingProcedural
 
             if (SweepDebug)
             {
-                DebugLogWithID("IgnoreSweepRootCollisions", "Ignored against " + neighbours.Count + " neighbouring parts");
+                DebugLogWithID("IgnoreSweepRootCollisions", "Ignored against " + neighbors.Count + " neighboring parts");
             }
         }
 
@@ -1532,6 +1982,10 @@ namespace WingProcedural
         /// and its bundled KSPCommunityFixes patch turns these very events on. Without it those
         /// extra joints pin the wing geometrically, through their locked LINEAR axes, and no
         /// amount of drive torque will turn it.
+        ///
+        /// KJR does not leave a part out of its bracing unless it is robotic, and rebuilds all of it
+        /// a physics frame after these very events, so this only clears the joints there are now;
+        /// FixedUpdate keeps clearing what KJR puts back (see KeepSweepBracingOff).
         /// </summary>
         private void SetSweepRoboticLock(bool locked)
         {
@@ -1551,7 +2005,9 @@ namespace WingProcedural
             }
             else
             {
-                // Prompt KJR to survey the vessel again and re-brace the wing at its new angle.
+                // Prompt KJR to survey the vessel again. It braces every part toward its as-built
+                // pose, so on a wing left swept its joints are cleared again (KeepSweepBracingOff);
+                // a wing back at neutral keeps them.
                 GameEvents.onVesselWasModified.Fire(vessel);
             }
 
@@ -1563,64 +2019,156 @@ namespace WingProcedural
         }
 
         /// <summary>
-        /// Delete the reinforcement joints that pin the wing. KJR ignores the robotic lock events
-        /// for a part it does not recognize as robotic, and its joints block rotation through their
-        /// locked LINEAR axes, so loosening them is not an option either - they have to go. The
-        /// attach joint stays, and so does anything holding our own children on, which means the
-        /// worst case is that the wing reverts to stock joint stiffness while it sweeps. KJR
-        /// rebuilds its bracing when the vessel is next reported modified, which re-locking does.
+        /// Delete the reinforcement joints that pin the wing: every joint between the wing (or
+        /// something it carries) and the rest of the vessel, other than attach joints and struts.
+        /// KJR ignores the robotic lock events for a part it does not recognize as robotic, and its
+        /// joints block rotation through their locked LINEAR axes, so loosening them is not an
+        /// option either - they have to go. A joint from a control surface on the wing to the
+        /// fuselage pins the wing just as well as one on the wing itself, so the hinge is the line,
+        /// not the part. Joints within the wing and what it carries move with it and stay. The
+        /// worst case is that the wing reverts to stock joint stiffness while it is off neutral.
+        ///
+        /// Runs every physics frame of a move, so it allocates nothing and only collects the
+        /// vessel's struts once it has found a joint that might be one.
         /// </summary>
         private int RemoveSweepBracing()
         {
-            int removed = 0;
-            ConfigurableJoint primary = part.attachJoint != null ? part.attachJoint.Joint : null;
-
-            ConfigurableJoint[] hosted = part.gameObject.GetComponents<ConfigurableJoint>();
-            for (int i = 0; i < hosted.Length; ++i)
+            if (vessel == null)
             {
-                // Every joint of our own PartJoint is structure, not reinforcement - a multi-joint
-                // attachment has more than one, and destroying the extras permanently weakens how
-                // the wing is held on.
-                if (hosted[i] != null && !IsOwnAttachJoint(hosted[i]))
+                return 0;
+            }
+
+            int removed = 0;
+            HashSet<ConfigurableJoint> struts = null;
+            for (int i = 0; i < vessel.parts.Count; ++i)
+            {
+                Part host = vessel.parts[i];
+                if (host == null || host.gameObject == null)
                 {
-                    Destroy(hosted[i]);
+                    continue;
+                }
+
+                bool hostCarried = CarriedByThisWing(host);
+                host.gameObject.GetComponents(sweepJointScratch);
+                for (int k = 0; k < sweepJointScratch.Count; ++k)
+                {
+                    ConfigurableJoint j = sweepJointScratch[k];
+                    // A joint to the world (a launch clamp's) is not bracing.
+                    Part other = j != null && j.connectedBody != null ? j.connectedBody.GetComponent<Part>() : null;
+                    if (other == null || CarriedByThisWing(other) == hostCarried)
+                    {
+                        continue;
+                    }
+
+                    // Every joint of a PartJoint is structure, not reinforcement - a multi-joint
+                    // attachment has more than one, and destroying the extras permanently weakens
+                    // how the wing is held on. Struts the player ran are not reinforcement either:
+                    // nothing rebuilds them, and deleting one silently kills it for the rest of the
+                    // flight. Their joints are hosted on the part at the strut's root end, so they
+                    // are recognized by joint, not by host.
+                    if (IsAttachJointOf(host, j) || IsStrutJoint(j, ref struts))
+                    {
+                        continue;
+                    }
+
+                    DropJoint(j);
                     ++removed;
                 }
             }
 
-            if (vessel == null || part.rb == null)
-            {
-                return removed;
-            }
-
-            for (int i = 0; i < vessel.parts.Count; ++i)
-            {
-                Part other = vessel.parts[i];
-                if (other == part || other.gameObject == null || IsDownstreamOfThisWing(other))
-                {
-                    continue;
-                }
-
-                ConfigurableJoint[] js = other.gameObject.GetComponents<ConfigurableJoint>();
-                // A CompoundPart is a strut or fuel line the player deliberately ran to this wing.
-                // It is not reinforcement, nothing rebuilds it, and deleting it silently kills the
-                // strut for the rest of the flight.
-                if (other is CompoundPart)
-                {
-                    continue;
-                }
-
-                for (int k = 0; k < js.Length; ++k)
-                {
-                    if (js[k] != null && js[k].connectedBody == part.rb && !IsAttachJointOf(other, js[k]))
-                    {
-                        Destroy(js[k]);
-                        ++removed;
-                    }
-                }
-            }
-
             return removed;
+        }
+
+        /// <summary>
+        /// Destroy waits for the end of the frame, and at high warp or a low frame rate several
+        /// physics steps run before then - each one with the joint still pulling the wing back. Free
+        /// it first so it does nothing in the meantime.
+        /// </summary>
+        private static void DropJoint(ConfigurableJoint j)
+        {
+            j.xMotion = j.yMotion = j.zMotion = ConfigurableJointMotion.Free;
+            j.angularXMotion = j.angularYMotion = j.angularZMotion = ConfigurableJointMotion.Free;
+            JointDrive none = new JointDrive();
+            j.xDrive = j.yDrive = j.zDrive = none;
+            j.angularXDrive = j.angularYZDrive = j.slerpDrive = none;
+            Destroy(j);
+        }
+
+        // Physics frames left in which to clear bracing rebuilt off the wing (see KeepSweepBracingOff).
+        private int sweepBracingWatch;
+        private const int SweepBracingWatchFrames = 4;
+        private const float SweepNeutralTolerance = 0.5f; // deg
+
+        /// <summary>
+        /// KJR builds every joint toward the craft's as-built pose (from orgPos and orgRot), not
+        /// the pose the part is in. On a wing that is moving, or held anywhere off neutral, each one
+        /// drags the wing back toward neutral against the drive and stretches its root - a pair
+        /// re-braced at 90 deg was knocked back to 70 and 22. So none may stay on the wing while it
+        /// is off neutral. KJR (and stock autostruts) only rebuild after a handful of events, a
+        /// physics frame later; those set a watch, and this clears what was built in the frames
+        /// after, before a physics step runs with it. While the wing moves it checks every frame.
+        /// </summary>
+        private void KeepSweepBracingOff()
+        {
+            bool watching = sweepBracingWatch > 0;
+            if (watching)
+            {
+                --sweepBracingWatch;
+            }
+
+            if (!sweepDriveJoint || !(watching || sweepRoboticUnlocked))
+            {
+                return;
+            }
+
+            if (!sweepRoboticUnlocked && Mathf.Abs(sweepCurrentAngle) < SweepNeutralTolerance)
+            {
+                return; // at neutral the as-built pose is the pose: KJR's bracing is right
+            }
+
+            int removed = RemoveSweepBracing();
+            if (removed > 0 && SweepDebug)
+            {
+                DebugLogWithID("KeepSweepBracingOff", "Bracing rebuilt off neutral, joints removed " + removed);
+            }
+        }
+
+        private void WatchSweepBracing(Vessel v)
+        {
+            if (v == vessel)
+            {
+                sweepBracingWatch = SweepBracingWatchFrames;
+            }
+        }
+
+        private void WatchSweepBracingRobotic(Part p, bool locked)
+        {
+            if (p != null)
+            {
+                WatchSweepBracing(p.vessel);
+            }
+        }
+
+        private void WatchSweepBracingAll()
+        {
+            sweepBracingWatch = SweepBracingWatchFrames;
+        }
+
+        private void WatchSweepBracingConstruction(bool open)
+        {
+            sweepBracingWatch = SweepBracingWatchFrames;
+        }
+
+        private static readonly List<ConfigurableJoint> sweepJointScratch = new List<ConfigurableJoint>();
+
+        private bool IsStrutJoint(ConfigurableJoint j, ref HashSet<ConfigurableJoint> struts)
+        {
+            if (struts == null)
+            {
+                struts = StrutJoints();
+            }
+
+            return struts.Contains(j);
         }
 
         private bool IsDownstreamOfThisWing(Part other)
@@ -1698,7 +2246,7 @@ namespace WingProcedural
             // their anchors - forbidden however many angular axes are free. It is a geometric
             // constraint, not a torque contest, which is why the wing only turned once those
             // joints were destroyed. Weakening them buys nothing, so they are left alone and KJR
-            // is asked to stand down instead, through the robotic-part lock events it honours.
+            // is asked to stand down instead, through the robotic-part lock events it honors.
             if (SweepDebug)
             {
                 // Counting foreign restraints walks the whole part list, so only do it when asked.
@@ -1711,9 +2259,20 @@ namespace WingProcedural
 
             if (sweepRestraints.Count == 0)
             {
+                // Most likely caught mid-rebuild, so survey again next frame. But a Physics wing
+                // does not animate while it waits for its joint, so one that never gets a usable
+                // joint would sit unswept all flight: after a while, fall back to the visual sweep.
                 sweepRestraints = null;
+                sweepJointChecked = false;
+                if (++sweepJointMissingCount >= SweepJointMissingLimit)
+                {
+                    AbandonSweepJoint(sweepCurrentAngle, "Variable aspect: wing has no usable attach joint - moving its model only");
+                }
+
                 return false;
             }
+
+            sweepJointMissingCount = 0;
 
             // Recapture the reference pose ONLY when the joint object itself is new. PhysX measures
             // targetRotation against the pose the joint was BUILT at, and re-surveying (which a
@@ -1739,6 +2298,7 @@ namespace WingProcedural
                 sweepJointNeutral = sweepJointCreation * Quaternion.Inverse(SweepRotation(persisted));
                 sweepJointCaptured = true;
                 sweepIntegral = 0f; // offset belonged to the old joint's frame of reference
+                sweepCommandValid = false;
             }
 
             IgnoreSweepRootCollisions();
@@ -1772,7 +2332,7 @@ namespace WingProcedural
 
             // Only the attach joint pulls the wing to the commanded angle. The rest simply stop
             // resisting rotation about that axis - a zero drive, so they cannot fight the driven
-            // one, and so a joint hosted on a neighbouring part never tries to rotate that part.
+            // one, and so a joint hosted on a neighboring part never tries to rotate that part.
             j.rotationDriveMode = RotationDriveMode.Slerp;
             j.slerpDrive = new JointDrive
             {
@@ -1807,6 +2367,16 @@ namespace WingProcedural
         public float sweepIntegralLimit = 20f;
 
         private float sweepIntegral;
+
+        // Rate-limited setpoint for the joint drive. Invalidated whenever the joint is (re)taken
+        // over, so it restarts from the wing's actual angle.
+        private float sweepCommand;
+        private bool sweepCommandValid;
+        private float sweepLastTarget;
+
+        // How far the setpoint may run ahead of the wing's actual angle (deg).
+        [KSPField]
+        public float sweepCommandLead = 5f;
 
         // How close counts as arrived, and how long it must stay there before KJR is allowed to
         // brace the wing again. Deliberately much tighter than the stall tolerance.
@@ -1854,11 +2424,12 @@ namespace WingProcedural
 
         /// <summary>
         /// Give up driving the joint and fall back to the visual sweep. Reached when the wing is
-        /// held by bracing the drive cannot overcome - continuing to push only spins the aircraft.
-        /// Every sweeping wing on the vessel gives up together: one wing physically swept and its
-        /// counterpart not is a worse aircraft than either mode consistently applied.
+        /// held by bracing the drive cannot overcome - continuing to push only spins the aircraft -
+        /// or when its attach joint never offers a joint to drive. The wing and its symmetry
+        /// counterparts give up together: one wing physically swept and its counterpart not is a
+        /// worse aircraft than either mode consistently applied.
         /// </summary>
-        private void AbandonSweepJoint(float actual)
+        private void AbandonSweepJoint(float actual, string why = BracedMessage)
         {
             // Symmetry counterparts only - NOT every wing on the vessel. The reason to give up
             // together is that one wing swept and its mirror image not is an asymmetric aircraft;
@@ -1893,7 +2464,7 @@ namespace WingProcedural
 
             for (int i = 0; i < givingUp.Count; ++i)
             {
-                givingUp[i].AbandonSweepJointLocal();
+                givingUp[i].AbandonSweepJointLocal(why);
             }
         }
 
@@ -1936,7 +2507,9 @@ namespace WingProcedural
             return angle * (Vector3.Dot(axis, SweepMeasureAxis) >= 0f ? 1f : -1f);
         }
 
-        private void AbandonSweepJointLocal()
+        private const string BracedMessage = "Variable aspect: wing is braced and cannot rotate - holding position";
+
+        private void AbandonSweepJointLocal(string why)
         {
             float actual = MeasuredSweepAngle();
 
@@ -1980,9 +2553,8 @@ namespace WingProcedural
 
             // Left ungated: this is a real failure the player is also told about on screen, and it
             // happens once per wing at most.
-            DebugLogWithID("AbandonSweepJoint", "Wing braced and cannot rotate, holding at " + actual.ToString("F1") + " deg");
-            ScreenMessages.PostScreenMessage("Variable aspect: wing is braced and cannot rotate - holding position",
-                                             8f, ScreenMessageStyle.UPPER_CENTER);
+            DebugLogWithID("AbandonSweepJoint", why + ", at " + actual.ToString("F1") + " deg");
+            ScreenMessages.PostScreenMessage(why, 8f, ScreenMessageStyle.UPPER_CENTER);
         }
 
         private float sweepReportTimer;
@@ -2001,7 +2573,7 @@ namespace WingProcedural
 
             sweepReportTimer -= Time.deltaTime;
             // Only while there is something to see - at rest this was a log line every second.
-            if (sweepReportTimer > 0f || (commanded == 0f && actual < 0.5f))
+            if (sweepReportTimer > 0f || (commanded == 0f && Mathf.Abs(actual) < 0.5f))
             {
                 return;
             }
@@ -2166,6 +2738,13 @@ namespace WingProcedural
             if (SweepEnabled && CanVarySweep)
             {
                 GameEvents.onVesselWasModified.Add(OnVesselModifiedForSweep);
+                // KJR's other rebuild triggers (onVesselWasModified is handled above)
+                GameEvents.onVesselGoOffRails.Add(WatchSweepBracing);
+                GameEvents.onPhysicsEaseStop.Add(WatchSweepBracing);
+                GameEvents.onRoboticPartLockChanging.Add(WatchSweepBracingRobotic);
+                GameEvents.OnGameSettingsApplied.Add(WatchSweepBracingAll);
+                GameEvents.onGameUnpause.Add(WatchSweepBracingAll);
+                GameEvents.OnEVAConstructionMode.Add(WatchSweepBracingConstruction);
             }
         }
         public List<WingProcedural> procws;
@@ -2242,6 +2821,16 @@ namespace WingProcedural
             GameEvents.onGameSceneLoadRequested.Remove(OnSceneSwitch);
             GameEvents.onEditorPartEvent.Remove(OnEditorPartEvent);
             GameEvents.onVesselWasModified.Remove(OnVesselModifiedForSweep);
+            GameEvents.onVesselGoOffRails.Remove(WatchSweepBracing);
+            GameEvents.onPhysicsEaseStop.Remove(WatchSweepBracing);
+            GameEvents.onRoboticPartLockChanging.Remove(WatchSweepBracingRobotic);
+            GameEvents.OnGameSettingsApplied.Remove(WatchSweepBracingAll);
+            GameEvents.onGameUnpause.Remove(WatchSweepBracingAll);
+            GameEvents.OnEVAConstructionMode.Remove(WatchSweepBracingConstruction);
+            if (sweepPinHighlighted != null)
+            {
+                sweepPinHighlighted.SetHighlightDefault();
+            }
         }
 
         public void CalcBase(int fieldID) //Calculate Geometry from angle ,originally by Rynco Lee modified by tetraflon, higher precision is required for angle calculations thus use Math double
@@ -2421,6 +3010,14 @@ namespace WingProcedural
             }
             return AngleBack;
         }
+        public void FixedUpdate()
+        {
+            if (isStarted && HighLogic.LoadedSceneIsFlight && SweepEnabled && CanVarySweep)
+            {
+                KeepSweepBracingOff();
+            }
+        }
+
         public void Update()
         {
             if (!isStarted)
@@ -2529,12 +3126,15 @@ namespace WingProcedural
                 part.crashTolerance = 15 + sharedArmorRatio;
             }
 
-            // Attaching against a previewed wing would place the child against the rotated
-            // collider while its part frame stays unswept, leaving it misplaced once the preview
-            // drops. Zeroing on attach/detach only - not on every part event in the editor.
-            if (type == ConstructionEventType.PartAttached || type == ConstructionEventType.PartDetached)
+            // A part picked up off a previewed wing: put the followers home now, while it is still
+            // where it was - its model is one of them, and once it moves with the cursor the
+            // neutral pose would land it offset from its own part. The preview then stays off
+            // until the part is placed (SweepPreviewAllowed), so nothing attaches against the
+            // swept collider, and comes back afterwards with the followers recaptured.
+            if ((type == ConstructionEventType.PartPicked || type == ConstructionEventType.PartDetached)
+                && sweepCurrentAngle != 0f && SweepEnabled)
             {
-                sweepPreviewPercent = 0f;
+                ApplySweepVisual(0f);
             }
         }
 
@@ -3349,6 +3949,7 @@ namespace WingProcedural
 
                 clone.sweepMode = sweepMode;
                 clone.sharedMaxSweepAngle = sharedMaxSweepAngle;
+                clone.sweepRate = sweepRate;
                 clone.sweepInvertFlaps = sweepInvertFlaps;
 
                 clone.sharedColorSTSaturation = clone.sharedColorSTSaturationCached = sharedColorSTSaturation;
@@ -5589,7 +6190,10 @@ namespace WingProcedural
 
         private void UpdateSweepPivotIndicator()
         {
-            if (!handlesEnabled || StaticWingGlobals.hingeIndicator == null)
+            // The handles (and the indicator in them) are on one wing at a time; a mode change
+            // anywhere else, a symmetry counterpart's included, must leave them alone.
+            if (!handlesEnabled || StaticWingGlobals.hingeIndicator == null
+                || StaticWingGlobals.handlesRoot == null || StaticWingGlobals.handlesRoot.transform.parent != part.transform)
             {
                 return;
             }
@@ -5972,7 +6576,19 @@ namespace WingProcedural
 
         public float GetModuleMass(float defaultMass, ModifierStagingSituation sit)
         {
-            return assemblyFARUsed ? 0 + sharedArmorRatio * (aeroUIMass - part.partInfo.partPrefab.mass) / 100 : (aeroUIMass - part.partInfo.partPrefab.mass) * (100 + sharedArmorRatio) / 100;
+            float own = assemblyFARUsed ? 0 + sharedArmorRatio * (aeroUIMass - part.partInfo.partPrefab.mass) / 100 : (aeroUIMass - part.partInfo.partPrefab.mass) * (100 + sharedArmorRatio) / 100;
+
+            if (movableMassMultiplier != 1f && SweepEnabled && CanVarySweep)
+            {
+                // Scale the whole wing, so under FAR that includes the structural mass FAR's own
+                // wing module adds. Read through KSP's interface - no FAR reference needed.
+                float far = assemblyFARUsed && aeroFARModuleReference is IPartMassModifier farMass
+                                ? farMass.GetModuleMass(defaultMass, sit)
+                                : 0f;
+                own += (defaultMass + own + far) * (movableMassMultiplier - 1f);
+            }
+
+            return own;
         }
 
         public ModifierChangeWhen GetModuleMassChangeWhen()
